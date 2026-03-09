@@ -273,7 +273,12 @@ createApp({
                     await this.handleLoadUsers();
                     break;
                 case 'logs':
-                    await this.handleLoadLogs();
+                    // 日志页面需要账号和用户数据用于筛选器
+                    await Promise.all([
+                        this.handleLoadAccounts(),
+                        this.handleLoadUsers(),
+                        this.handleLoadLogs()
+                    ]);
                     if (this.showLogsStatsPanel) {
                         await this.handleLoadLogsStats();
                     }

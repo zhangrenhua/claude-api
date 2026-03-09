@@ -942,6 +942,9 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                 <div class="page-header">
                     <h2 class="page-header-title">请求日志</h2>
                     <div class="page-header-actions">
+                        <button class="btn btn--secondary" @click="handleToggleUserStatsPanel">
+                            <i class="btn-icon" :class="showUserStatsPanel ? 'ri-arrow-up-s-line' : 'ri-team-line'"></i> {{ showUserStatsPanel ? '收起用户统计' : '用户统计' }}
+                        </button>
                         <button class="btn btn--secondary" @click="handleToggleLogsStatsPanel">
                             <i class="btn-icon" :class="showLogsStatsPanel ? 'ri-arrow-up-s-line' : 'ri-bar-chart-line'"></i> {{ showLogsStatsPanel ? '收起统计' : '展开统计' }}
                         </button>
@@ -981,6 +984,55 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                     </div>
                 </div>
 
+                <!-- 用户统计表格 -->
+                <div v-if="showUserStatsPanel" style="margin-top: 12px; margin-bottom: 15px;">
+                    <div style="background: var(--color-bg-elevated); border-radius: 8px; padding: 15px;">
+                        <h3 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">用户使用统计</h3>
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>用户</th>
+                                        <th>请求次数</th>
+                                        <th>成功次数</th>
+                                        <th>失败次数</th>
+                                        <th>输入Token</th>
+                                        <th>输出Token</th>
+                                        <th>总Token</th>
+                                        <th>总消费</th>
+                                        <th>平均耗时</th>
+                                        <th>最后请求</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="stat in userStats" :key="stat.user_id">
+                                        <td>
+                                            <span v-if="stat.is_vip" class="user-badge user-badge--vip">
+                                                <i class="ri-vip-crown-fill"></i>{{ stat.user_name }}
+                                            </span>
+                                            <span v-else class="user-badge user-badge--normal">
+                                                <i class="ri-user-line"></i>{{ stat.user_name }}
+                                            </span>
+                                        </td>
+                                        <td><strong>{{ stat.request_count }}</strong></td>
+                                        <td><span class="badge badge--success">{{ stat.success_count }}</span></td>
+                                        <td><span class="badge badge--error">{{ stat.failed_count }}</span></td>
+                                        <td>{{ stat.total_input_tokens.toLocaleString() }}</td>
+                                        <td>{{ stat.total_output_tokens.toLocaleString() }}</td>
+                                        <td><strong>{{ stat.total_tokens.toLocaleString() }}</strong></td>
+                                        <td><strong>{{ formatCostUSD(stat.total_cost_usd) }}</strong></td>
+                                        <td>{{ stat.avg_duration_ms.toFixed(0) }}ms</td>
+                                        <td style="font-size: 11px;">{{ formatLogTime(stat.last_request_time) }}</td>
+                                    </tr>
+                                    <tr v-if="userStats.length === 0">
+                                        <td colspan="10" style="text-align: center; color: var(--color-text-secondary);">暂无用户统计数据</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 筛选器 -->
                 <div class="filter-bar" style="margin-bottom: 15px; padding: 15px; background: var(--color-bg-elevated); border-radius: 8px;">
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 10px;">
@@ -1003,6 +1055,26 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                     <div class="custom-select-option" :class="{ 'is-selected': !logsFilters.accountID }" @click="logsFilters.accountID = ''; accountSelectOpen = false">所有账号</div>
                                     <div class="custom-select-option" v-for="account in accounts" :key="account.id" :class="{ 'is-selected': logsFilters.accountID === account.id }" @click="logsFilters.accountID = account.id; accountSelectOpen = false">
                                         {{ account.label || `#${getAccountShortId(account.id)}` }}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 12px; color: var(--color-text-secondary); margin-bottom: 4px;">用户</label>
+                            <div class="custom-select" :class="{ 'is-open': userSelectOpen }">
+                                <div class="custom-select-trigger" @click="userSelectOpen = !userSelectOpen">
+                                    <span>{{ logsFilters.userID ? (users.find(u => u.id === logsFilters.userID)?.name || '未知用户') : '所有用户' }}</span>
+                                    <i class="ri-arrow-down-s-line"></i>
+                                </div>
+                                <div class="custom-select-options" v-show="userSelectOpen">
+                                    <div class="custom-select-option" :class="{ 'is-selected': !logsFilters.userID }" @click="logsFilters.userID = ''; userSelectOpen = false">所有用户</div>
+                                    <div class="custom-select-option" v-for="user in users" :key="user.id" :class="{ 'is-selected': logsFilters.userID === user.id }" @click="logsFilters.userID = user.id; userSelectOpen = false">
+                                        <span v-if="user.is_vip" class="user-badge user-badge--vip" style="font-size: 11px;">
+                                            <i class="ri-vip-crown-fill"></i>{{ user.name }}
+                                        </span>
+                                        <span v-else class="user-badge user-badge--normal" style="font-size: 11px;">
+                                            <i class="ri-user-line"></i>{{ user.name }}
+                                        </span>
                                     </div>
                                 </div>
                             </div>
@@ -1045,8 +1117,9 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                         <button class="btn btn--secondary" @click="handleSetLogsTimeRange('today')">当天</button>
                         <button class="btn btn--secondary" @click="handleSetLogsTimeRange('24h')">最近24小时</button>
                         <button class="btn btn--secondary" @click="handleSetLogsTimeRange('7d')">最近7天</button>
+                        <button class="btn btn--secondary" @click="handleSetLogsTimeRange('30d')">最近30天</button>
                         <button class="btn btn--secondary" @click="handleResetLogsFilters">重置</button>
-                        <button class="btn btn--primary" @click="handleLoadLogs">查询</button>
+                        <button class="btn btn--primary" @click="handleLoadLogs(); showUserStatsPanel && handleLoadUserStats()">查询</button>
                     </div>
                 </div>
 

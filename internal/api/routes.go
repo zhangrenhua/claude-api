@@ -173,6 +173,7 @@ func (s *Server) setupConsoleRoutes(r *gin.Engine) {
 	{
 		logsGroup.GET("", s.handleGetLogs)
 		logsGroup.GET("/stats", s.handleGetStats)
+		logsGroup.GET("/user-stats", s.handleGetUserUsageStats)
 		logsGroup.POST("/cleanup", s.requireTestModePassword, s.handleCleanupLogs) // 测试模式需要密码
 	}
 
