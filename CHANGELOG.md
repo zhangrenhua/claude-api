@@ -1,107 +1,145 @@
-# 更新日志 (Changelog)
+# 更新日志
 
-## [2026-03-09] - 日志管理增强版
+## v1.2.0 (2026-03-12)
 
-### 🎉 新增功能
+### 新增功能
 
-#### 1. 用户使用统计功能
-- **用户筛选器**: 在请求日志页面新增"用户"下拉选择器，可按用户筛选日志
-- **用户统计面板**: 新增"用户统计"按钮，展开后显示每个用户的详细使用情况
-  - 请求次数（总数、成功、失败）
-  - Token 消耗（输入、输出、总计）
-  - 总消费金额（美元）
-  - 平均响应时间
-  - 最后请求时间
-- **用户使用分析**: 支持按时间范围、账号、端点类型等条件查看用户统计
+#### 用户管理系统
+- ✅ 新增完整的用户管理功能
+- ✅ 支持创建和管理多个用户，每个用户独立的 API Key
+- ✅ 用户级别的配额管理（每日/每月 Token 限制）
+- ✅ 请求频率限制（RPM - Requests Per Minute）
+- ✅ 临时用户支持，可设置过期时间（1-365天）
+- ✅ 用户使用统计（请求次数、Token 消耗、费用统计）
+- ✅ 批量创建 VIP 用户功能
 
-#### 2. 日志保留期限优化
-- **默认保留期**: 从 7 天延长至 30 天
-- **更长查询范围**: 新增"最近30天"快捷查询按钮
+#### 前端界面
+- ✅ 用户管理标签页，支持表格和卡片两种视图
+- ✅ 用户列表显示过期时间和状态（已过期/即将过期/永不过期）
+- ✅ 创建用户时支持选择过期日期
+- ✅ 快捷按钮设置过期时间（1/3/7/15/30/90天）
+- ✅ 用户统计图表和详细数据展示
+- ✅ 日志筛选支持按用户和账号过滤
 
-#### 3. 性能优化
-- **并行加载**: 日志页面切换时并行加载账号、用户、日志数据，提升加载速度
-- **智能缓存**: 优化数据加载逻辑，避免重复请求
+### 系统优化
 
-### 📝 修改的文件
+#### 账号限制
+- ✅ 删除100个账号限制，现在支持无限数量的账号
 
-#### 后端文件
+#### 日志功能
+- ✅ 修复日志筛选下拉框数据加载问题
+- ✅ 优化日志查询性能
 
-1. **internal/models/request_log.go**
-   - 新增 `UserStat` 结构体，用于用户统计数据
-   - 在 `LogFilters` 中添加 `UserID` 字段支持用户筛选
+#### 前端修复
+- ✅ 修复前端白屏问题
+- ✅ 完善前端文件结构
 
-2. **internal/database/logs.go**
-   - 新增 `GetUserUsageStats()` 方法，按用户分组统计使用情况
-   - 在 `applyLogFiltersGorm()` 中添加用户ID筛选逻辑
+### API 变更
 
-3. **internal/database/settings.go**
-   - 修改 `LogRetentionDays` 默认值从 7 改为 30
+#### 新增接口
+- `POST /v2/users` - 创建用户（支持过期时间）
+- `POST /v2/users/temp` - 创建临时用户（指定天数）
+- `POST /v2/users/batch-vip` - 批量创建 VIP 用户
+- `GET /v2/users` - 获取用户列表
+- `GET /v2/users/:id` - 获取用户详情
+- `PATCH /v2/users/:id` - 更新用户信息
+- `DELETE /v2/users/:id` - 删除用户
+- `POST /v2/users/:id/regenerate-key` - 重新生成 API Key
+- `GET /v2/users/:id/stats` - 获取用户统计
+- `GET /v2/users/:id/ips` - 获取用户关联的 IP 列表
 
-4. **internal/api/handlers.go**
-   - 新增 `handleGetUserUsageStats()` API 处理函数
-   - 在 `handleGetLogs()` 中添加 `user_id` 参数支持
-   - 在 `handleGetStats()` 中添加 `user_id` 参数支持
+#### 数据库变更
+- 新增 `users` 表
+- 新增 `user_token_usage` 表
+- User 表新增 `expires_at` 字段（过期时间）
 
-5. **internal/api/routes.go**
-   - 新增路由 `GET /v2/logs/user-stats` 用于获取用户统计
+### 技术细节
 
-#### 前端文件
+#### 后端
+- 新增 `internal/api/handlers_users.go` - 用户管理处理器
+- 更新 `internal/models/user.go` - 用户模型
+- 更新 `internal/database/users.go` - 用户数据库操作
+- 更新 `internal/config/config.go` - 配置管理
 
-1. **frontend/js/logs.js**
-   - 新增 `userStats` 数据字段存储用户统计
-   - 新增 `showUserStatsPanel` 控制用户统计面板显示
-   - 新增 `userSelectOpen` 控制用户选择器状态
-   - 在 `logsFilters` 中添加 `userID` 字段
-   - 新增 `handleToggleUserStatsPanel()` 方法切换统计面板
-   - 新增 `handleLoadUserStats()` 方法加载用户统计数据
-   - 在 `handleLoadLogs()` 和 `handleLoadLogsStats()` 中添加 `user_id` 参数传递
-   - 在 `handleSetLogsTimeRange()` 中添加 30 天选项支持
-   - 在时间范围切换和筛选重置时同步刷新用户统计
+#### 前端
+- 更新 `frontend/js/users.js` - 用户管理逻辑
+- 更新 `frontend/js/app.js` - 应用主逻辑
+- 更新 `frontend/index.html` - 用户界面
 
-2. **frontend/index.html**
-   - 在日志页面头部添加"用户统计"按钮
-   - 在筛选器中添加"用户"下拉选择器（位于账号和客户端IP之间）
-   - 新增用户统计表格，显示详细的用户使用数据
-   - 在时间范围快捷按钮中添加"最近30天"选项
-   - 修改查询按钮逻辑，同时刷新日志和用户统计
+### 安全性
+- ✅ 用户过期检查在 API 认证阶段自动执行
+- ✅ 过期用户自动拒绝访问（返回 401）
+- ✅ 支持永不过期的用户（ExpiresAt = nil）
 
-3. **frontend/js/app.js**
-   - 优化 `loadTabData()` 方法，在加载日志页面时并行加载账号、用户、日志数据
-   - 使用 `Promise.all()` 实现并行加载，提升页面切换速度
-
-### 🔧 技术细节
-
-- **数据库查询优化**: 使用批量查询和 JOIN 优化用户统计性能
-- **前端性能**: 使用 Vue 响应式数据和条件渲染优化界面更新
-- **API 设计**: RESTful 风格，支持完整的筛选条件传递
-
-### 📊 使用方法
-
-1. **查看用户统计**:
-   - 进入"请求日志"页面
-   - 点击"用户统计"按钮展开统计面板
-   - 可配合时间范围、账号等筛选条件查看特定时段的用户统计
-
-2. **按用户筛选日志**:
-   - 在筛选器中选择"用户"下拉框
-   - 选择特定用户查看其日志记录
-
-3. **查询30天日志**:
-   - 点击"最近30天"按钮快速设置时间范围
-   - 或手动设置开始/结束时间
-
-### 🐛 已知问题
-
-- 无
-
-### 📌 注意事项
-
-- 首次使用需要重新编译项目：`go build -o claude-server main.go`
-- 浏览器需要强制刷新（Ctrl+Shift+R 或 Cmd+Shift+R）以加载新的前端文件
-- 日志保留天数的修改只影响新安装，已有配置不会自动更新
+### 文档
+- ✅ 更新 README.md，添加用户管理功能说明
+- ✅ 更新 CHANGELOG.md
 
 ---
 
-## 历史版本
+## v1.1.0 (之前版本)
 
-查看 Git 提交历史获取更多信息。
+### 核心功能
+- AWS Kiro 账号池管理
+- OpenAI 兼容 API
+- Claude Messages API 支持
+- Web 管理控制台
+- 请求日志和统计
+- IP 黑名单管理
+- 系统设置管理
+
+---
+
+## 升级说明
+
+### 从 v1.1.0 升级到 v1.2.0
+
+1. **数据库自动迁移**
+   - GORM 会自动添加新的表和字段
+   - 无需手动执行 SQL
+
+2. **配置兼容**
+   - 所有现有配置保持兼容
+   - 无需修改配置文件
+
+3. **API 兼容**
+   - 所有现有 API 保持兼容
+   - 新增的用户管理 API 不影响现有功能
+
+4. **升级步骤**
+   ```bash
+   # 1. 备份数据库
+   cp data.sqlite3 data.sqlite3.backup
+
+   # 2. 停止服务
+   # systemctl stop claude-api  # 如果使用 systemd
+
+   # 3. 替换二进制文件
+   # 下载新版本并替换
+
+   # 4. 启动服务
+   ./claude-api
+   # systemctl start claude-api  # 如果使用 systemd
+
+   # 5. 验证
+   # 访问 http://localhost:62311 检查新功能
+   ```
+
+---
+
+## 已知问题
+
+### v1.2.0
+- 无
+
+---
+
+## 贡献者
+
+感谢所有为本项目做出贡献的开发者！
+
+---
+
+## 反馈
+
+如有问题或建议，请提交 [Issue](https://github.com/kkddytd/claude-api/issues)。
