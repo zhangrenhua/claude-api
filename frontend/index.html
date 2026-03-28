@@ -1494,6 +1494,11 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                     </div>
                                     <small class="form-hint">选择多账号时的分配策略，加权随机会根据配额剩余和使用情况智能分配</small>
                                 </div>
+                                <div class="form-group" v-if="settingsData.accountSelectionMode === 'cooldown'">
+                                    <label class="form-label">冷却时间（秒）</label>
+                                    <input type="number" class="form-input" v-model.number="settingsData.accountCooldownSeconds" min="0" max="3600" placeholder="60">
+                                    <small class="form-hint">每个账号请求完成后需等待该时间后才能再次被调度，范围 0-3600 秒</small>
+                                </div>
                                 <div class="form-group">
                                     <label class="form-label">HTTP/SOCKS5 代理</label>
                                     <input type="text" class="form-input" v-model="settingsData.httpProxy" placeholder="http://proxy:port 或 socks5://user:pass@proxy:port">

@@ -18,7 +18,11 @@ const (
 	AccountSelectionRandom         = "random"          // 随机选择
 	AccountSelectionWeightedRandom = "weighted_random" // 加权随机选择
 	AccountSelectionRoundRobin     = "round_robin"     // 轮询选择
+	AccountSelectionCooldown       = "cooldown"        // 冷却时间选择
 )
+
+// DefaultAccountCooldownSeconds 默认账号冷却时间（秒）
+const DefaultAccountCooldownSeconds = 60
 
 // SupportedAccountSelectionModes 支持的账号选择方式列表
 var SupportedAccountSelectionModes = []map[string]string{
@@ -26,6 +30,7 @@ var SupportedAccountSelectionModes = []map[string]string{
 	{"value": AccountSelectionRandom, "label": "随机选择", "description": "随机选择一个账号"},
 	{"value": AccountSelectionWeightedRandom, "label": "加权随机", "description": "根据配额剩余、使用时间等因素加权选择"},
 	{"value": AccountSelectionRoundRobin, "label": "轮询选择", "description": "顺序轮流使用每个账号"},
+	{"value": AccountSelectionCooldown, "label": "冷却时间", "description": "每个账号请求完成后需等待冷却时间后才能再被调度"},
 }
 
 // Settings 表示系统配置（用于 API 响应）
@@ -43,7 +48,8 @@ type Settings struct {
 	Port                 int      `json:"port"`
 	PortConfigured       bool     `json:"-"` // 标记用户是否配置过端口（不序列化到JSON）
 	LayoutFullWidth      bool     `json:"layoutFullWidth"`
-	AccountSelectionMode string   `json:"accountSelectionMode"` // 账号选择方式: sequential, random, weighted_random, round_robin
+	AccountSelectionMode    string   `json:"accountSelectionMode"`    // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown
+	AccountCooldownSeconds  int      `json:"accountCooldownSeconds"`  // 账号冷却时间（秒），cooldown 模式下生效
 	// 代理配置
 	HTTPProxy string `json:"httpProxy"` // HTTP/HTTPS/SOCKS5 代理地址
 	// 代理池配置
@@ -77,7 +83,8 @@ type SettingsUpdate struct {
 	MaxErrorCount        *int      `json:"maxErrorCount"`
 	Port                 *int      `json:"port"`
 	LayoutFullWidth      *bool     `json:"layoutFullWidth"`
-	AccountSelectionMode *string   `json:"accountSelectionMode"` // 账号选择方式
+	AccountSelectionMode   *string   `json:"accountSelectionMode"`   // 账号选择方式
+	AccountCooldownSeconds *int      `json:"accountCooldownSeconds"` // 账号冷却时间（秒）
 	// 代理配置
 	HTTPProxy *string `json:"httpProxy"`
 	// 代理池配置

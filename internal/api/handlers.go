@@ -1800,6 +1800,7 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 		"port":                           settings.Port,
 		"layoutFullWidth":                settings.LayoutFullWidth,
 		"accountSelectionMode":           settings.AccountSelectionMode,
+		"accountCooldownSeconds":         settings.AccountCooldownSeconds,
 		"supportedAccountSelectionModes": models.SupportedAccountSelectionModes,
 		// 代理配置
 		"httpProxy": settings.HTTPProxy,

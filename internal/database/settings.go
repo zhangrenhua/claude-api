@@ -26,6 +26,7 @@ func (db *DB) GetSettings(ctx context.Context) (*models.Settings, error) {
 		Port:                    db.cfg.Port,
 		LayoutFullWidth:         false,
 		AccountSelectionMode:    models.AccountSelectionSequential, // 默认顺序选择
+		AccountCooldownSeconds:  models.DefaultAccountCooldownSeconds, // 默认冷却60秒
 		CompressionEnabled:      false,
 		CompressionModel:        models.DefaultCompressionModel,
 		QuotaRefreshConcurrency: 20,  // 默认 20 并发
@@ -82,6 +83,11 @@ func (db *DB) GetSettings(ctx context.Context) (*models.Settings, error) {
 			if s.Value != "" {
 				settings.AccountSelectionMode = s.Value
 				db.cfg.AccountSelectionMode = s.Value
+			}
+		case "account_cooldown_seconds":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+				settings.AccountCooldownSeconds = v
+				db.cfg.AccountCooldownSeconds = v
 			}
 		// 兼容旧的 random_account_selection 配置
 		case "random_account_selection":
@@ -234,6 +240,7 @@ func (db *DB) UpdateSettings(ctx context.Context, updates *models.SettingsUpdate
 				models.AccountSelectionRandom:         true,
 				models.AccountSelectionWeightedRandom: true,
 				models.AccountSelectionRoundRobin:     true,
+				models.AccountSelectionCooldown:       true,
 			}
 			if !validModes[mode] {
 				mode = models.AccountSelectionSequential
@@ -242,6 +249,20 @@ func (db *DB) UpdateSettings(ctx context.Context, updates *models.SettingsUpdate
 				return err
 			}
 			db.cfg.AccountSelectionMode = mode
+		}
+
+		if updates.AccountCooldownSeconds != nil {
+			v := *updates.AccountCooldownSeconds
+			if v < 0 {
+				v = 0
+			}
+			if v > 3600 {
+				v = 3600
+			}
+			if err := upsertSetting("account_cooldown_seconds", fmt.Sprintf("%d", v)); err != nil {
+				return err
+			}
+			db.cfg.AccountCooldownSeconds = v
 		}
 
 		if updates.CompressionEnabled != nil {

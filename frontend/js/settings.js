@@ -33,6 +33,7 @@ export const settingsMixin = {
                 ipRateLimitMax: 100,
                 blockedIPs: [],
                 accountSelectionMode: 'sequential',
+                accountCooldownSeconds: 60,
                 supportedAccountSelectionModes: [],
                 // 代理配置
                 httpProxy: '',
@@ -197,6 +198,7 @@ export const settingsMixin = {
                         ipRateLimitMax: data.ipRateLimitMax || 100,
                         blockedIPs: data.blockedIPs || [],
                         accountSelectionMode: data.accountSelectionMode || 'sequential',
+                        accountCooldownSeconds: data.accountCooldownSeconds !== undefined ? data.accountCooldownSeconds : 60,
                         supportedAccountSelectionModes: data.supportedAccountSelectionModes || [],
                         // 代理配置
                         httpProxy: data.httpProxy || '',
@@ -626,7 +628,8 @@ export const settingsMixin = {
                 'sequential': '顺序选择',
                 'random': '随机选择',
                 'weighted_random': '加权随机',
-                'round_robin': '轮询选择'
+                'round_robin': '轮询选择',
+                'cooldown': '冷却时间'
             };
             return modeLabels[mode] || '顺序选择';
         }

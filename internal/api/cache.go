@@ -24,15 +24,17 @@ type AccountPool struct {
 	cfg             accountPoolConfig // 配置
 	refreshing      atomic.Bool       // 是否正在刷新
 	roundRobinIndex uint32            // 轮询索引（用于 round_robin 模式）
+	lastUsedTime    sync.Map          // 账号最后使用时间 map[string]time.Time（用于 cooldown 模式）
 }
 
 // accountPoolConfig 账号池配置
 type accountPoolConfig struct {
-	lazyEnabled   bool   // 是否启用懒加载模式
-	lazyPoolSize  int    // 懒加载池大小
-	lazyOrderBy   string // 懒加载排序字段
-	lazyOrderDesc bool   // 懒加载是否降序
-	selectionMode string // 账号选择方式: sequential, random, weighted_random, round_robin
+	lazyEnabled      bool   // 是否启用懒加载模式
+	lazyPoolSize     int    // 懒加载池大小
+	lazyOrderBy      string // 懒加载排序字段
+	lazyOrderDesc    bool   // 懒加载是否降序
+	selectionMode    string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown
+	cooldownSeconds  int    // 冷却时间（秒），cooldown 模式下生效
 }
 
 // NewAccountPool 创建新的账号池
@@ -100,6 +102,10 @@ func (p *AccountPool) Refresh(ctx context.Context) {
 	p.cfg.selectionMode = dbCfg.AccountSelectionMode
 	if p.cfg.selectionMode == "" {
 		p.cfg.selectionMode = models.AccountSelectionSequential
+	}
+	p.cfg.cooldownSeconds = dbCfg.AccountCooldownSeconds
+	if p.cfg.cooldownSeconds <= 0 {
+		p.cfg.cooldownSeconds = models.DefaultAccountCooldownSeconds
 	}
 	p.cfg.lazyEnabled = dbCfg.LazyAccountPoolEnabled
 	p.cfg.lazyPoolSize = dbCfg.LazyAccountPoolSize
@@ -169,6 +175,10 @@ func (p *AccountPool) selectAccount(accounts []*models.Account, mode string) *mo
 		// 轮询选择
 		idx := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
 		return accounts[idx%uint32(len(accounts))]
+
+	case models.AccountSelectionCooldown:
+		// 冷却时间选择
+		return p.selectCooldown(accounts)
 
 	default: // sequential 或其他
 		// 顺序选择（返回第一个）
@@ -268,6 +278,56 @@ func (p *AccountPool) selectWeightedRandom(accounts []*models.Account) *models.A
 	}
 
 	return accounts[0]
+}
+
+// selectCooldown 冷却时间选择账号
+// 过滤掉处于冷却期内的账号，从可用账号中按轮询方式选择
+func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account {
+	p.mu.RLock()
+	cooldownDuration := time.Duration(p.cfg.cooldownSeconds) * time.Second
+	p.mu.RUnlock()
+
+	now := time.Now()
+	var available []*models.Account
+
+	for _, acc := range accounts {
+		if lastUsed, ok := p.lastUsedTime.Load(acc.ID); ok {
+			if now.Sub(lastUsed.(time.Time)) < cooldownDuration {
+				continue // 仍在冷却中，跳过
+			}
+		}
+		available = append(available, acc)
+	}
+
+	if len(available) == 0 {
+		// 所有账号都在冷却中，选择冷却时间最久的（即最早可用的）
+		var earliest *models.Account
+		var earliestTime time.Time
+		for _, acc := range accounts {
+			if lastUsed, ok := p.lastUsedTime.Load(acc.ID); ok {
+				usedTime := lastUsed.(time.Time)
+				if earliest == nil || usedTime.Before(earliestTime) {
+					earliest = acc
+					earliestTime = usedTime
+				}
+			} else {
+				return acc // 从未使用过的账号优先
+			}
+		}
+		if earliest != nil {
+			return earliest
+		}
+		return accounts[0]
+	}
+
+	// 从可用账号中轮询选择
+	idx := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
+	return available[idx%uint32(len(available))]
+}
+
+// NotifyUsed 通知账号已被使用（记录使用时间，用于 cooldown 模式）
+func (p *AccountPool) NotifyUsed(accountID string) {
+	p.lastUsedTime.Store(accountID, time.Now())
 }
 
 // GetAccountExcluding 获取一个账号，排除指定的账号 ID
