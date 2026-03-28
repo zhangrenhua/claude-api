@@ -1583,9 +1583,6 @@ func (s *Server) dbWriteWorker(workerID int) {
 
 // QueueStatsUpdate 将统计更新加入队列
 func (s *Server) QueueStatsUpdate(accountID string, success bool) {
-	// 记录账号使用时间（用于 cooldown 模式）
-	s.accountPool.NotifyUsed(accountID)
-
 	if s.closing.Load() {
 		return // 服务器正在关闭，忽略更新
 	}
