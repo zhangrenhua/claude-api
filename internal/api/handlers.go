@@ -2173,6 +2173,13 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		// 选择账号（排除已尝试的）
 		acc, err = s.selectAccountExcluding(c.Request.Context(), triedIDs)
 		if err != nil || acc == nil {
+			// 判断是否因为冷却模式导致无账号可用
+			if s.accountPool.GetSelectionMode() == models.AccountSelectionCooldown && s.accountPool.Count() > 0 {
+				logger.Warn("所有账号冷却中 - 来源: %s", clientIP)
+				c.Set("error_message", "所有账号正在冷却中，请稍后重试")
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": "所有账号正在冷却中，请稍后重试"})
+				return
+			}
 			logger.Warn("无可用账号 - 来源: %s, 已尝试: %d", clientIP, len(triedIDs))
 			c.Set("error_message", "无可用账号，请先添加并配置账号")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "无可用账号，请先添加并配置账号"})

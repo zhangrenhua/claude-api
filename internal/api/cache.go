@@ -282,6 +282,7 @@ func (p *AccountPool) selectWeightedRandom(accounts []*models.Account) *models.A
 
 // selectCooldown 冷却时间选择账号
 // 过滤掉处于冷却期内的账号，从可用账号中按轮询方式选择
+// 所有账号都在冷却中时返回 nil，由上层返回错误提示
 // 选中后立即标记使用时间，确保后续请求不会在冷却期内重复选中同一账号
 func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account {
 	p.mu.RLock()
@@ -300,36 +301,15 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 		available = append(available, acc)
 	}
 
-	var selected *models.Account
-
 	if len(available) == 0 {
-		// 所有账号都在冷却中，选择冷却时间最久的（即最早可用的）
-		var earliest *models.Account
-		var earliestTime time.Time
-		for _, acc := range accounts {
-			if lastUsed, ok := p.lastUsedTime.Load(acc.ID); ok {
-				usedTime := lastUsed.(time.Time)
-				if earliest == nil || usedTime.Before(earliestTime) {
-					earliest = acc
-					earliestTime = usedTime
-				}
-			} else {
-				selected = acc // 从未使用过的账号优先
-				break
-			}
-		}
-		if selected == nil {
-			if earliest != nil {
-				selected = earliest
-			} else {
-				selected = accounts[0]
-			}
-		}
-	} else {
-		// 从可用账号中轮询选择
-		idx := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
-		selected = available[idx%uint32(len(available))]
+		// 所有账号都在冷却中，返回 nil 拒绝请求
+		logger.Debug("[账号池] 冷却模式: 所有 %d 个账号均在冷却期内（%ds），拒绝调度", len(accounts), p.cfg.cooldownSeconds)
+		return nil
 	}
+
+	// 从可用账号中轮询选择
+	idx := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
+	selected := available[idx%uint32(len(available))]
 
 	// 选中后立即标记使用时间，防止并发请求重复选中
 	p.lastUsedTime.Store(selected.ID, time.Now())
