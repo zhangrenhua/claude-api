@@ -326,17 +326,35 @@ func (s *Server) RefreshAllAccountsQuota(ctx context.Context) {
 					atomic.AddInt32(&exhaustedCount, 1)
 					return
 				}
-				// 检查是否为 token 失效
+				// 检查是否为 token 失效，尝试刷新令牌后重试
 				if amazonq.IsErrorCode(err, amazonq.ErrCodeTokenInvalid) || amazonq.IsErrorCode(err, amazonq.ErrCodeTokenExpired) {
-					logger.Debug("[配额同步] 账号 %s Token 失效 - 耗时: %.0fms", account.ID, elapsed.Seconds()*1000)
-					s.handleAccountStatusByError(ctx, account.ID, "EXPIRED_TOKEN")
-					atomic.AddInt32(&expiredCount, 1)
+					logger.Info("[配额同步] 账号 %s Token 失效，尝试刷新令牌后重试 - 耗时: %.0fms", account.ID, elapsed.Seconds()*1000)
+					if refreshErr := s.refreshAccountToken(ctx, account.ID); refreshErr != nil {
+						logger.Warn("[配额同步] 账号 %s 令牌刷新失败: %v，标记为过期", account.ID, refreshErr)
+						s.handleAccountStatusByError(ctx, account.ID, "EXPIRED_TOKEN")
+						atomic.AddInt32(&expiredCount, 1)
+						return
+					}
+					// 令牌刷新成功，重新获取账号信息并重试配额查询
+					refreshedAcc, getErr := s.db.GetAccount(ctx, account.ID)
+					if getErr != nil || refreshedAcc == nil || refreshedAcc.AccessToken == nil || *refreshedAcc.AccessToken == "" {
+						logger.Warn("[配额同步] 账号 %s 刷新后获取信息失败", account.ID)
+						atomic.AddInt32(&errorCount, 1)
+						return
+					}
+					quota, err = s.aqClient.GetUsageLimits(ctx, *refreshedAcc.AccessToken, machineId, "AGENTIC_REQUEST")
+					if err != nil {
+						logger.Warn("[配额同步] 账号 %s 刷新令牌后重试配额查询仍失败: %v", account.ID, err)
+						atomic.AddInt32(&errorCount, 1)
+						return
+					}
+					// 重试成功，继续后面的配额解析逻辑
+				} else {
+					// 其他错误只记录日志
+					logger.Debug("[配额同步] 账号 %s 同步失败 - 耗时: %.0fms, 错误: %v", account.ID, elapsed.Seconds()*1000, err)
+					atomic.AddInt32(&errorCount, 1)
 					return
 				}
-				// 其他错误只记录日志
-				logger.Debug("[配额同步] 账号 %s 同步失败 - 耗时: %.0fms, 错误: %v", account.ID, elapsed.Seconds()*1000, err)
-				atomic.AddInt32(&errorCount, 1)
-				return
 			}
 
 			// 提取配额信息
@@ -462,17 +480,35 @@ func (s *Server) RefreshAllAccountsQuotaWithStats(ctx context.Context) map[strin
 					atomic.AddInt32(&exhaustedCount, 1)
 					return
 				}
-				// 检查是否为 token 失效
+				// 检查是否为 token 失效，尝试刷新令牌后重试
 				if amazonq.IsErrorCode(err, amazonq.ErrCodeTokenInvalid) || amazonq.IsErrorCode(err, amazonq.ErrCodeTokenExpired) {
-					logger.Debug("[配额同步] 账号 %s Token 失效 - 耗时: %.0fms", account.ID, elapsed.Seconds()*1000)
-					s.handleAccountStatusByError(ctx, account.ID, "EXPIRED_TOKEN")
-					atomic.AddInt32(&expiredCount, 1)
+					logger.Info("[配额同步] 账号 %s Token 失效，尝试刷新令牌后重试 - 耗时: %.0fms", account.ID, elapsed.Seconds()*1000)
+					if refreshErr := s.refreshAccountToken(ctx, account.ID); refreshErr != nil {
+						logger.Warn("[配额同步] 账号 %s 令牌刷新失败: %v，标记为过期", account.ID, refreshErr)
+						s.handleAccountStatusByError(ctx, account.ID, "EXPIRED_TOKEN")
+						atomic.AddInt32(&expiredCount, 1)
+						return
+					}
+					// 令牌刷新成功，重新获取账号信息并重试配额查询
+					refreshedAcc, getErr := s.db.GetAccount(ctx, account.ID)
+					if getErr != nil || refreshedAcc == nil || refreshedAcc.AccessToken == nil || *refreshedAcc.AccessToken == "" {
+						logger.Warn("[配额同步] 账号 %s 刷新后获取信息失败", account.ID)
+						atomic.AddInt32(&errorCount, 1)
+						return
+					}
+					quota, err = s.aqClient.GetUsageLimits(ctx, *refreshedAcc.AccessToken, machineId, "AGENTIC_REQUEST")
+					if err != nil {
+						logger.Warn("[配额同步] 账号 %s 刷新令牌后重试配额查询仍失败: %v", account.ID, err)
+						atomic.AddInt32(&errorCount, 1)
+						return
+					}
+					// 重试成功，继续后面的配额解析逻辑
+				} else {
+					// 其他错误只记录日志
+					logger.Debug("[配额同步] 账号 %s 同步失败 - 耗时: %.0fms, 错误: %v", account.ID, elapsed.Seconds()*1000, err)
+					atomic.AddInt32(&errorCount, 1)
 					return
 				}
-				// 其他错误只记录日志
-				logger.Debug("[配额同步] 账号 %s 同步失败 - 耗时: %.0fms, 错误: %v", account.ID, elapsed.Seconds()*1000, err)
-				atomic.AddInt32(&errorCount, 1)
-				return
 			}
 
 			// 提取配额信息
