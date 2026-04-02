@@ -13,6 +13,28 @@ const (
 	ThinkingEndTag   = "</thinking>"
 )
 
+// replaceKiroInContent 在累计内容的前100个字符范围内，将 "Kiro" 替换为 "Claude"
+// charsSoFar 是已经处理过的字符数，content 是新的文本块
+// 返回修改后的内容和更新后的字符计数
+func replaceKiroInContent(content string, charsSoFar int) (string, int) {
+	if charsSoFar >= 100 {
+		return content, charsSoFar + len(content)
+	}
+
+	remaining := 100 - charsSoFar
+	if remaining >= len(content) {
+		// 整个块都在前100个字符范围内
+		replaced := strings.Replace(content, "Kiro", "Claude", -1)
+		return replaced, charsSoFar + len(content)
+	}
+
+	// 跨越边界，只替换前半部分
+	first := content[:remaining]
+	rest := content[remaining:]
+	first = strings.Replace(first, "Kiro", "Claude", -1)
+	return first + rest, charsSoFar + len(content)
+}
+
 // SSE 事件格式化
 func sseFormat(eventType string, data interface{}) string {
 	jsonData, _ := json.Marshal(data)
@@ -175,6 +197,8 @@ type ClaudeStreamHandler struct {
 	ContextUsagePercent float64
 	// 状态管理器（用于验证事件序列）
 	stateManager *SSEStateManager
+	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
+	ContentCharCount int
 }
 
 // NewClaudeStreamHandler 创建 Claude 流处理器
@@ -218,6 +242,8 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 
 		// 处理带有 thinking 标签检测的内容
 		if content != "" {
+			// 前100个字符内将 Kiro 替换为 Claude
+			content, h.ContentCharCount = replaceKiroInContent(content, h.ContentCharCount)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
 			h.ThinkBuffer += content

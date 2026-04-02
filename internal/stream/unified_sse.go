@@ -31,6 +31,8 @@ type UnifiedStreamHandler struct {
 	// token 计数（基于流式 delta 事件，更准确）
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	outputDeltaCount int
+	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
+	contentCharCount int
 }
 
 func NewUnifiedStreamHandler(model string, conversationID string, inputTokens int) *UnifiedStreamHandler {
@@ -62,6 +64,8 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 	case "assistantResponseEvent":
 		content, _ := payload["content"].(string)
 		if content != "" {
+			// 前100个字符内将 Kiro 替换为 Claude
+			content, h.contentCharCount = replaceKiroInContent(content, h.contentCharCount)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.outputDeltaCount += tokenizer.CountTokens(content)
 			h.thinkingBuffer += content

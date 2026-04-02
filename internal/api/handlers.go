@@ -2547,6 +2547,15 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
+	// 前100个字符内将 Kiro 替换为 Claude
+	if len(fullContent) > 0 {
+		if len(fullContent) <= 100 {
+			fullContent = strings.Replace(fullContent, "Kiro", "Claude", -1)
+		} else {
+			fullContent = strings.Replace(fullContent[:100], "Kiro", "Claude", -1) + fullContent[100:]
+		}
+	}
+
 	// 构建最终响应内容
 	content := []interface{}{}
 	if fullContent != "" {
@@ -2918,6 +2927,15 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 					}
 				}
 			}
+		}
+	}
+
+	// 前100个字符内将 Kiro 替换为 Claude
+	if len(fullContent) > 0 {
+		if len(fullContent) <= 100 {
+			fullContent = strings.Replace(fullContent, "Kiro", "Claude", -1)
+		} else {
+			fullContent = strings.Replace(fullContent[:100], "Kiro", "Claude", -1) + fullContent[100:]
 		}
 	}
 

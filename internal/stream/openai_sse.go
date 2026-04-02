@@ -55,6 +55,8 @@ type OpenAIStreamHandler struct {
 	// token 计数（基于流式 delta 事件，更准确）
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	OutputDeltaCount int
+	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
+	ContentCharCount int
 }
 
 // buildChunk 构建 OpenAI 流式响应块
@@ -104,6 +106,8 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 	case "assistantResponseEvent":
 		content, _ := payload["content"].(string)
 		if content != "" {
+			// 前100个字符内将 Kiro 替换为 Claude
+			content, h.ContentCharCount = replaceKiroInContent(content, h.ContentCharCount)
 			// 每个 assistantResponseEvent 对应一个 token（参考 anthropic-tokenizer 项目）
 			h.OutputDeltaCount++
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
