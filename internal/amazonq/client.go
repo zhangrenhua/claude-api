@@ -397,6 +397,8 @@ func (c *Client) SendChatRequest(ctx context.Context, accessToken, machineId, ac
 			// 检查是否为不可重试的错误
 			if nrErr := checkNonRetriableError(bodyStr); nrErr != nil {
 				logger.Warn("检测到不可重试错误: %s - %s (提示: %s)", nrErr.Code, nrErr.Message, nrErr.Hint)
+				// 记录完整请求体到错误日志，方便排查格式问题
+				saveErrorRequestLog(reqBody, bodyStr, nrErr.Code, logTimestamp)
 				return nil, nrErr
 			}
 
@@ -490,6 +492,57 @@ func saveRequestLog(reqBody []byte, timestamp string) {
 			// 正常完成
 		case <-time.After(30 * time.Second):
 			logger.Warn("保存请求日志超时（30秒），跳过: %s", timestamp)
+		}
+	}()
+}
+
+// saveErrorRequestLog 出现上游错误时保存完整请求体和错误响应，方便排查
+func saveErrorRequestLog(reqBody []byte, respBody string, errorCode string, timestamp string) {
+	data := make([]byte, len(reqBody))
+	copy(data, reqBody)
+	respCopy := respBody
+
+	go func() {
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			logDir := filepath.Join("logs", "error_logs")
+			if err := os.MkdirAll(logDir, 0755); err != nil {
+				logger.Error("创建错误日志目录失败: %v", err)
+				return
+			}
+
+			filename := fmt.Sprintf("%s_%s_error.log", timestamp, errorCode)
+			filePath := filepath.Join(logDir, filename)
+
+			var buf bytes.Buffer
+			buf.WriteString(fmt.Sprintf("=== 错误码: %s ===\n", errorCode))
+			buf.WriteString(fmt.Sprintf("=== 时间: %s ===\n\n", time.Now().Format("2006-01-02 15:04:05")))
+			buf.WriteString("=== 上游响应 ===\n")
+			buf.WriteString(respCopy)
+			buf.WriteString("\n\n=== 请求体 ===\n")
+
+			var prettyJSON bytes.Buffer
+			if err := json.Indent(&prettyJSON, data, "", "  "); err != nil {
+				buf.Write(data)
+			} else {
+				buf.Write(prettyJSON.Bytes())
+			}
+
+			if err := os.WriteFile(filePath, buf.Bytes(), 0644); err != nil {
+				logger.Error("保存错误日志失败: %v", err)
+				return
+			}
+
+			logger.Info("错误请求已保存到: %s", filePath)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			logger.Warn("保存错误日志超时（30秒），跳过: %s", timestamp)
 		}
 	}()
 }
