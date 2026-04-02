@@ -56,7 +56,8 @@ type OpenAIStreamHandler struct {
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	OutputDeltaCount int
 	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
-	ContentCharCount int
+	ContentCharCount  int
+	PendingKiroBuffer string
 }
 
 // buildChunk 构建 OpenAI 流式响应块
@@ -107,7 +108,7 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 		content, _ := payload["content"].(string)
 		if content != "" {
 			// 前100个字符内将 Kiro 替换为 Claude
-			content, h.ContentCharCount = replaceKiroInContent(content, h.ContentCharCount)
+			content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 			// 每个 assistantResponseEvent 对应一个 token（参考 anthropic-tokenizer 项目）
 			h.OutputDeltaCount++
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
@@ -225,6 +226,13 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 		}
 
 	case "assistantResponseEnd":
+		// flush 残留的 Kiro 替换缓冲
+		if h.PendingKiroBuffer != "" {
+			h.ResponseBuffer = append(h.ResponseBuffer, h.PendingKiroBuffer)
+			events = append(events, BuildOpenAIChunk(h.ID, h.Model, h.PendingKiroBuffer, ""))
+			h.PendingKiroBuffer = ""
+		}
+
 		// 发送结束块
 		finishReason := "stop"
 		if len(h.ToolCalls) > 0 {

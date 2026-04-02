@@ -14,25 +14,52 @@ const (
 )
 
 // replaceKiroInContent 在累计内容的前100个字符范围内，将 "Kiro" 替换为 "Claude"
-// charsSoFar 是已经处理过的字符数，content 是新的文本块
-// 返回修改后的内容和更新后的字符计数
-func replaceKiroInContent(content string, charsSoFar int) (string, int) {
+// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上一次未输出的尾部缓冲
+// 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
+// pending 用于处理 "Kiro" 跨 chunk 边界的情况（如 chunk1="...Ki", chunk2="ro..."）
+func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
+	// 已超过100字符，不再需要替换，flush pending 并直接返回
 	if charsSoFar >= 100 {
-		return content, charsSoFar + len(content)
+		return pending + content, charsSoFar + len(pending) + len(content), ""
 	}
 
+	// 将 pending 和新 content 合并处理
+	combined := pending + content
+
+	// 计算前100字符范围内需要处理的长度
 	remaining := 100 - charsSoFar
-	if remaining >= len(content) {
-		// 整个块都在前100个字符范围内
-		replaced := strings.Replace(content, "Kiro", "Claude", -1)
-		return replaced, charsSoFar + len(content)
+	var toProcess, passThrough string
+	if remaining >= len(combined) {
+		toProcess = combined
+		passThrough = ""
+	} else {
+		toProcess = combined[:remaining]
+		passThrough = combined[remaining:]
 	}
 
-	// 跨越边界，只替换前半部分
-	first := content[:remaining]
-	rest := content[remaining:]
-	first = strings.Replace(first, "Kiro", "Claude", -1)
-	return first + rest, charsSoFar + len(content)
+	// 在前100字符范围内做替换
+	replaced := strings.Replace(toProcess, "Kiro", "Claude", -1)
+
+	// 如果还在前100字符范围内，检查尾部是否有 "Kiro" 的部分前缀需要缓冲
+	newCharsSoFar := charsSoFar
+	newPending := ""
+	if passThrough == "" {
+		// 整段都在前100字符内，检查尾部是否可能是 "Kiro" 的前缀
+		for i := min(3, len(replaced)); i > 0; i-- {
+			suffix := replaced[len(replaced)-i:]
+			if strings.HasPrefix("Kiro", suffix) {
+				newPending = suffix
+				replaced = replaced[:len(replaced)-i]
+				break
+			}
+		}
+		newCharsSoFar += len(replaced)
+		return replaced, newCharsSoFar, newPending
+	}
+
+	// 跨越100字符边界，不需要再缓冲
+	newCharsSoFar += len(replaced) + len(passThrough)
+	return replaced + passThrough, newCharsSoFar, ""
 }
 
 // SSE 事件格式化
@@ -198,7 +225,8 @@ type ClaudeStreamHandler struct {
 	// 状态管理器（用于验证事件序列）
 	stateManager *SSEStateManager
 	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
-	ContentCharCount int
+	ContentCharCount   int
+	PendingKiroBuffer  string
 }
 
 // NewClaudeStreamHandler 创建 Claude 流处理器
@@ -243,7 +271,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 		// 处理带有 thinking 标签检测的内容
 		if content != "" {
 			// 前100个字符内将 Kiro 替换为 Claude
-			content, h.ContentCharCount = replaceKiroInContent(content, h.ContentCharCount)
+			content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
 			h.ThinkBuffer += content
@@ -401,6 +429,14 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 		}
 
 	case "assistantResponseEnd":
+		// flush 残留的 Kiro 替换缓冲
+		if h.PendingKiroBuffer != "" {
+			h.ThinkBuffer += h.PendingKiroBuffer
+			h.PendingKiroBuffer = ""
+			flushEvents := h.processThinkBuffer()
+			events = append(events, flushEvents...)
+		}
+
 		// 关闭任何打开的块
 		if h.ContentBlockStarted && !h.ContentBlockStopSent {
 			events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
