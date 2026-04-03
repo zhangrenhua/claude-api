@@ -2237,8 +2237,9 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 							inputTokens = countClaudeInputTokens(&req)
 							logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
 
-							// 尝试压缩后重试（仅一次）
-							if s.compressor != nil && !c.GetBool("compression_retried") {
+							// 尝试压缩后重试（仅一次，需开启智能压缩）
+							compressionSettings, _ := s.db.GetSettings(c.Request.Context())
+							if s.compressor != nil && compressionSettings != nil && compressionSettings.CompressionEnabled && !c.GetBool("compression_retried") {
 								c.Set("compression_retried", true)
 								logger.Info("[自动压缩重试] 上游返回内容超限，尝试压缩后重试")
 								compressedReq, compressErr := s.compressor.ForceCompress(c.Request.Context(), &req,
@@ -2788,7 +2789,8 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 				if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
 					logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
 
-					if s.compressor != nil && !c.GetBool("compression_retried") {
+					compressionSettings, _ := s.db.GetSettings(c.Request.Context())
+					if s.compressor != nil && compressionSettings != nil && compressionSettings.CompressionEnabled && !c.GetBool("compression_retried") {
 						c.Set("compression_retried", true)
 						logger.Info("[自动压缩重试] OpenAI接口 - 上游返回内容超限，尝试压缩后重试")
 						compressedReq, compressErr := s.compressor.ForceCompress(c.Request.Context(), claudeReq,
