@@ -303,6 +303,55 @@ func extractToolUseIDs(content interface{}) []string {
 	return ids
 }
 
+// cleanOrphanToolResults 清理保留消息中孤立的 tool_result
+// 压缩后，部分 tool_use 所在的 assistant 消息已被替换为摘要文本，
+// 保留消息中引用这些 tool_use 的 tool_result 会导致上游 INVALID_REQUEST
+func cleanOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessage {
+	// 收集所有 assistant 消息中的 tool_use id
+	availableToolUseIDs := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			for _, id := range extractToolUseIDs(msg.Content) {
+				availableToolUseIDs[id] = true
+			}
+		}
+	}
+
+	// 清理 user 消息中引用不存在的 tool_use 的 tool_result
+	result := make([]models.ClaudeMessage, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role == "user" {
+			blocks, ok := msg.Content.([]interface{})
+			if ok {
+				var cleaned []interface{}
+				removedCount := 0
+				for _, block := range blocks {
+					m, ok := block.(map[string]interface{})
+					if ok && m["type"] == "tool_result" {
+						toolUseID, _ := m["tool_use_id"].(string)
+						if toolUseID != "" && !availableToolUseIDs[toolUseID] {
+							removedCount++
+							continue // 跳过孤立的 tool_result
+						}
+					}
+					cleaned = append(cleaned, block)
+				}
+				if removedCount > 0 {
+					logger.Info("[智能压缩] 清理 %d 个孤立的 tool_result", removedCount)
+					if len(cleaned) == 0 {
+						// 所有内容都是孤立的 tool_result，替换为占位文本
+						msg.Content = "Tool results from previous context (compressed)."
+					} else {
+						msg.Content = interface{}(cleaned)
+					}
+				}
+			}
+		}
+		result = append(result, msg)
+	}
+	return result
+}
+
 // generateSummary 生成摘要
 // @author ygw
 func (c *Compressor) generateSummary(ctx context.Context,
@@ -613,6 +662,9 @@ func (c *Compressor) buildCompressedRequestWithBlocks(original *models.ClaudeReq
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString("[摘要结束，以下是最近的对话]")
+
+	// 清理 keepMsgs 中孤立的 tool_result（对应的 tool_use 已被压缩为摘要）
+	keepMsgs = cleanOrphanToolResults(keepMsgs)
 
 	// 构建新消息列表
 	newMessages := make([]models.ClaudeMessage, 0, len(keepMsgs)+2)
