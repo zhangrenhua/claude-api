@@ -2232,10 +2232,30 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 				if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
 					// 请求本身的错误（如输入过长），换号也没用，直接返回
 					if nrErr.IsRequestErr {
-						// 如果是上下文超出错误，打印具体的 token 数量
+						// 如果是上下文超出错误，尝试压缩后重试
 						if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
-							inputTokens := countClaudeInputTokens(&req)
+							inputTokens = countClaudeInputTokens(&req)
 							logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
+
+							// 尝试压缩后重试（仅一次）
+							if s.compressor != nil && !c.GetBool("compression_retried") {
+								c.Set("compression_retried", true)
+								logger.Info("[自动压缩重试] 上游返回内容超限，尝试压缩后重试")
+								compressedReq, compressErr := s.compressor.ForceCompress(c.Request.Context(), &req,
+									func(ctx context.Context, content, model string) (string, error) {
+										return s.callSummaryAPI(ctx, content, model)
+									})
+								if compressErr == nil && compressedReq != nil {
+									req = *compressedReq
+									inputTokens = countClaudeInputTokens(&req)
+									logger.Info("[自动压缩重试] 压缩完成 - Token: %d, 消息数: %d，重新发送请求", inputTokens, len(req.Messages))
+									// 重置重试状态，用当前账号重新发送
+									triedIDs = triedIDs[:len(triedIDs)-1]
+									retry--
+									continue
+								}
+								logger.Warn("[自动压缩重试] 压缩失败: %v，返回原始错误", compressErr)
+							}
 						}
 						logger.Warn("检测到请求错误，终止重试 - 错误: %s, 提示: %s", nrErr.Message, nrErr.Hint)
 						c.Set("error_message", nrErr.Message)
@@ -2764,9 +2784,35 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 		// 检查是否为不可重试错误
 		if amazonq.IsNonRetriable(err) {
 			if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
-				// 如果是上下文超出错误，打印具体的 token 数量
+				// 如果是上下文超出错误，尝试压缩后重试
 				if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
 					logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
+
+					if s.compressor != nil && !c.GetBool("compression_retried") {
+						c.Set("compression_retried", true)
+						logger.Info("[自动压缩重试] OpenAI接口 - 上游返回内容超限，尝试压缩后重试")
+						compressedReq, compressErr := s.compressor.ForceCompress(c.Request.Context(), claudeReq,
+							func(ctx context.Context, content, model string) (string, error) {
+								return s.callSummaryAPI(ctx, content, model)
+							})
+						if compressErr == nil && compressedReq != nil {
+							claudeReq = compressedReq
+							inputTokens = countClaudeInputTokens(claudeReq)
+							aqPayload2, convErr2 := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
+							if convErr2 == nil {
+								resp2, err2 := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
+								if err2 == nil {
+									logger.Info("[自动压缩重试] OpenAI接口 - 压缩后重试成功 - Token: %d, 消息数: %d", inputTokens, len(claudeReq.Messages))
+									resp = resp2
+									err = nil
+									goto openaiHandleResponse
+								}
+								logger.Warn("[自动压缩重试] OpenAI接口 - 压缩后重试仍失败: %v", err2)
+							}
+						} else {
+							logger.Warn("[自动压缩重试] OpenAI接口 - 压缩失败: %v", compressErr)
+						}
+					}
 				}
 				// 请求错误不计入账号统计
 				if !nrErr.IsRequestErr {
@@ -2793,6 +2839,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+openaiHandleResponse:
 	if req.Stream {
 		s.handleOpenAIStreamResponse(c, resp, req.Model, responseID, clientIP, startTime, len(req.Messages), account, inputTokens)
 	} else {

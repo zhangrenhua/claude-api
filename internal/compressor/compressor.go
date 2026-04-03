@@ -87,6 +87,18 @@ func (c *Compressor) countTokens(messages []models.ClaudeMessage, systemPrompt i
 	return total
 }
 
+// ForceCompress 强制压缩，跳过阈值检查（用于上游返回内容超限时的自动重试）
+func (c *Compressor) ForceCompress(ctx context.Context, req *models.ClaudeRequest,
+	summarizer SummarizerFunc) (*models.ClaudeRequest, error) {
+
+	if len(req.Messages) <= c.config.KeepMessageCount {
+		return nil, fmt.Errorf("消息数 %d 不足以压缩（保留 %d 条）", len(req.Messages), c.config.KeepMessageCount)
+	}
+
+	logger.Info("[强制压缩] 触发 - 消息数: %d", len(req.Messages))
+	return c.compressIncremental(ctx, req, nil, 0, summarizer)
+}
+
 // CompressIfNeeded 如果需要则执行压缩（分块模式）
 // 使用消息内容 hash 匹配缓存，支持增量压缩和多摘要块复用
 // @author ygw
