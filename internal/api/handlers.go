@@ -2158,6 +2158,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 				req = *compressedReq
 				inputTokens = countClaudeInputTokens(&req)
 				logger.Info("[智能压缩] 完成 - Token: %d, 消息数: %d", inputTokens, len(req.Messages))
+				c.Set("compression_retried", true) // 标记已压缩，避免超限时重复压缩
 			}
 		}
 	}
