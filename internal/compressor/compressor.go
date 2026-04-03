@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"claude-api/internal/logger"
 	"claude-api/internal/models"
@@ -67,7 +68,7 @@ func (c *Compressor) countTokens(messages []models.ClaudeMessage, systemPrompt i
 		total += 3 // system prompt 格式开销
 	}
 
-	// 计算消息内容
+	// 计算消息内容（包含 text、tool_use input、tool_result）
 	for _, msg := range messages {
 		total += 4 // role + 格式开销
 		if content, ok := msg.Content.(string); ok {
@@ -75,9 +76,33 @@ func (c *Compressor) countTokens(messages []models.ClaudeMessage, systemPrompt i
 		} else if contentList, ok := msg.Content.([]interface{}); ok {
 			for _, block := range contentList {
 				if blockMap, ok := block.(map[string]interface{}); ok {
-					if blockMap["type"] == "text" {
+					switch blockMap["type"] {
+					case "text":
 						if text, ok := blockMap["text"].(string); ok {
 							total += tokenizer.CountTokens(text)
+						}
+					case "tool_use":
+						// 工具名称 + 输入参数
+						if name, ok := blockMap["name"].(string); ok {
+							total += tokenizer.CountTokens(name)
+						}
+						if input, ok := blockMap["input"]; ok && input != nil {
+							if inputJSON, err := json.Marshal(input); err == nil {
+								total += tokenizer.CountTokens(string(inputJSON))
+							}
+						}
+					case "tool_result":
+						// 工具结果内容
+						if rc, ok := blockMap["content"].(string); ok {
+							total += tokenizer.CountTokens(rc)
+						} else if rcList, ok := blockMap["content"].([]interface{}); ok {
+							for _, item := range rcList {
+								if im, ok := item.(map[string]interface{}); ok {
+									if text, ok := im["text"].(string); ok {
+										total += tokenizer.CountTokens(text)
+									}
+								}
+							}
 						}
 					}
 				}
@@ -470,12 +495,17 @@ func (c *Compressor) generateSummary(ctx context.Context,
 func (c *Compressor) generateBatchSummary(ctx context.Context,
 	content string, summarizer SummarizerFunc) (string, error) {
 
-	// 按字符数分割
+	// 按字符数分割（确保不在 UTF-8 多字节字符中间切割）
 	var batches []string
 	for len(content) > 0 {
 		end := c.config.MaxBatchChars
 		if end > len(content) {
 			end = len(content)
+		} else {
+			// 回退到 UTF-8 字符边界
+			for end > 0 && !utf8.RuneStart(content[end]) {
+				end--
+			}
 		}
 		batches = append(batches, content[:end])
 		content = content[end:]
@@ -678,16 +708,21 @@ func (c *Compressor) buildCompressedRequestWithBlocks(original *models.ClaudeReq
 	// 清理 keepMsgs 中孤立的 tool_result（对应的 tool_use 已被压缩为摘要）
 	keepMsgs = cleanOrphanToolResults(keepMsgs)
 
-	// 构建新消息列表
+	// 构建新消息列表，确保 user/assistant 交替
 	newMessages := make([]models.ClaudeMessage, 0, len(keepMsgs)+2)
 	newMessages = append(newMessages, models.ClaudeMessage{
 		Role:    "user",
 		Content: sb.String(),
 	})
-	newMessages = append(newMessages, models.ClaudeMessage{
-		Role:    "assistant",
-		Content: fmt.Sprintf("好的，我已了解之前的对话上下文（共 %d 个摘要块）。请继续。", len(blocks)),
-	})
+	// 如果 keepMsgs 第一条是 assistant，跳过确认消息避免连续 assistant
+	if len(keepMsgs) > 0 && keepMsgs[0].Role == "assistant" {
+		logger.Debug("[智能压缩] keepMsgs 以 assistant 开头，跳过确认消息")
+	} else {
+		newMessages = append(newMessages, models.ClaudeMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("好的，我已了解之前的对话上下文（共 %d 个摘要块）。请继续。", len(blocks)),
+		})
+	}
 	newMessages = append(newMessages, keepMsgs...)
 
 	// 复制原请求并替换消息
