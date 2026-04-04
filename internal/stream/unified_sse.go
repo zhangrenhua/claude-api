@@ -31,7 +31,7 @@ type UnifiedStreamHandler struct {
 	// token 计数（基于流式 delta 事件，更准确）
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	outputDeltaCount int
-	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
+	// 累计内容字符数，用于前200字符品牌名/模型名替换
 	contentCharCount  int
 	pendingKiroBuffer string
 	// 缓存 token 信息（本地计算）
@@ -75,7 +75,7 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 	case "assistantResponseEvent":
 		content, _ := payload["content"].(string)
 		if content != "" {
-			// 前100个字符内将 Kiro 替换为 Claude
+			// 前200个字符内做品牌名和模型名替换
 			content, h.contentCharCount, h.pendingKiroBuffer = replaceKiroInContent(content, h.contentCharCount, h.pendingKiroBuffer)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.outputDeltaCount += tokenizer.CountTokens(content)

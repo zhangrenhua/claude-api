@@ -4,6 +4,7 @@ import (
 	"claude-api/internal/tokenizer"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -13,21 +14,49 @@ const (
 	ThinkingEndTag   = "</thinking>"
 )
 
-// replaceKiroInContent 在累计内容的前100个字符范围内，将 "Kiro" 替换为 "Claude"
+// ReplaceBranding 对文本做品牌名和模型名替换
+// 1. Kiro → Claude
+// 2. 上游可能返回的旧模型名（如 "Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)"）→ "Claude Opus"
+func ReplaceBranding(text string) string {
+	// Kiro → Claude
+	text = strings.Replace(text, "Kiro", "Claude", -1)
+
+	// 模型名替换：将上游返回的旧模型自称统一替换为 "Claude Opus"
+	const brandName = "Claude Opus"
+	text = modelWithParenPattern.ReplaceAllString(text, brandName)
+	text = modelFriendlyPattern.ReplaceAllString(text, brandName)
+	text = modelIDPattern.ReplaceAllString(text, brandName)
+	return text
+}
+
+// 模型名正则（预编译，避免每次调用重新编译）
+var (
+	// 匹配带括号的完整格式：Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)
+	modelWithParenPattern = regexp.MustCompile(`Claude\s+[\d.]+\s+\w+\s*\(claude-[\w.-]+\)`)
+	// 匹配友好名格式：Claude 3.5 Sonnet、Claude 4 Opus 等
+	modelFriendlyPattern = regexp.MustCompile(`Claude\s+[\d.]+\s+(?:Sonnet|Opus|Haiku)`)
+	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-4-opus-20250514 等
+	modelIDPattern = regexp.MustCompile(`claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
+)
+
+// replaceKiroInContent 在累计内容的前200个字符范围内，做品牌名和模型名替换
 // charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上一次未输出的尾部缓冲
+// requestModel 是用户请求的模型名，用于模型名替换
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
 // pending 用于处理 "Kiro" 跨 chunk 边界的情况（如 chunk1="...Ki", chunk2="ro..."）
 func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
-	// 已超过100字符，不再需要替换，flush pending 并直接返回
-	if charsSoFar >= 100 {
+	const replaceLimit = 200
+
+	// 已超过限制字符数，不再需要替换，flush pending 并直接返回
+	if charsSoFar >= replaceLimit {
 		return pending + content, charsSoFar + len(pending) + len(content), ""
 	}
 
 	// 将 pending 和新 content 合并处理
 	combined := pending + content
 
-	// 计算前100字符范围内需要处理的长度
-	remaining := 100 - charsSoFar
+	// 计算前 replaceLimit 字符范围内需要处理的长度
+	remaining := replaceLimit - charsSoFar
 	var toProcess, passThrough string
 	if remaining >= len(combined) {
 		toProcess = combined
@@ -37,14 +66,14 @@ func replaceKiroInContent(content string, charsSoFar int, pending string) (strin
 		passThrough = combined[remaining:]
 	}
 
-	// 在前100字符范围内做替换
-	replaced := strings.Replace(toProcess, "Kiro", "Claude", -1)
+	// 在范围内做替换
+	replaced := ReplaceBranding(toProcess)
 
-	// 如果还在前100字符范围内，检查尾部是否有 "Kiro" 的部分前缀需要缓冲
+	// 如果还在范围内，检查尾部是否有 "Kiro" 的部分前缀需要缓冲
 	newCharsSoFar := charsSoFar
 	newPending := ""
 	if passThrough == "" {
-		// 整段都在前100字符内，检查尾部是否可能是 "Kiro" 的前缀
+		// 整段都在范围内，检查尾部是否可能是 "Kiro" 的前缀
 		for i := min(3, len(replaced)); i > 0; i-- {
 			suffix := replaced[len(replaced)-i:]
 			if strings.HasPrefix("Kiro", suffix) {
@@ -57,7 +86,7 @@ func replaceKiroInContent(content string, charsSoFar int, pending string) (strin
 		return replaced, newCharsSoFar, newPending
 	}
 
-	// 跨越100字符边界，不需要再缓冲
+	// 跨越边界，不需要再缓冲
 	newCharsSoFar += len(replaced) + len(passThrough)
 	return replaced + passThrough, newCharsSoFar, ""
 }
@@ -230,7 +259,7 @@ type ClaudeStreamHandler struct {
 	ContextUsagePercent float64
 	// 状态管理器（用于验证事件序列）
 	stateManager *SSEStateManager
-	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
+	// 累计内容字符数，用于前200字符品牌名/模型名替换
 	ContentCharCount   int
 	PendingKiroBuffer  string
 	// 缓存 token 信息（本地计算）
@@ -279,7 +308,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 
 		// 处理带有 thinking 标签检测的内容
 		if content != "" {
-			// 前100个字符内将 Kiro 替换为 Claude
+			// 前200个字符内做品牌名和模型名替换
 			content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.OutputDeltaCount += tokenizer.CountTokens(content)

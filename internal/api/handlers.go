@@ -2599,12 +2599,12 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 前100个字符内将 Kiro 替换为 Claude
+	// 前200个字符内做品牌名和模型名替换
 	if len(fullContent) > 0 {
-		if len(fullContent) <= 100 {
-			fullContent = strings.Replace(fullContent, "Kiro", "Claude", -1)
+		if len(fullContent) <= 200 {
+			fullContent = stream.ReplaceBranding(fullContent)
 		} else {
-			fullContent = strings.Replace(fullContent[:100], "Kiro", "Claude", -1) + fullContent[100:]
+			fullContent = stream.ReplaceBranding(fullContent[:200]) + fullContent[200:]
 		}
 	}
 
@@ -3025,12 +3025,12 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 前100个字符内将 Kiro 替换为 Claude
+	// 前200个字符内做品牌名和模型名替换
 	if len(fullContent) > 0 {
-		if len(fullContent) <= 100 {
-			fullContent = strings.Replace(fullContent, "Kiro", "Claude", -1)
+		if len(fullContent) <= 200 {
+			fullContent = stream.ReplaceBranding(fullContent)
 		} else {
-			fullContent = strings.Replace(fullContent[:100], "Kiro", "Claude", -1) + fullContent[100:]
+			fullContent = stream.ReplaceBranding(fullContent[:200]) + fullContent[200:]
 		}
 	}
 
