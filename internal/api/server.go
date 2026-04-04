@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"claude-api/internal/amazonq"
 	"claude-api/internal/auth"
+	"claude-api/internal/cache"
 	"claude-api/internal/compressor"
 	"claude-api/internal/config"
 	"claude-api/internal/database"
@@ -63,6 +64,9 @@ type Server struct {
 	suspendedCache    sync.Map // map[accountID]suspendedCacheEntry
 	suspendedCacheTTL time.Duration
 	suspendedCacheMu  sync.Mutex
+
+	// Prompt 缓存追踪器（本地模拟 cache token 计算）
+	promptCache *cache.PromptCache
 }
 
 // suspendedCacheEntry 账号封控状态缓存条目
@@ -181,6 +185,7 @@ func NewServer(cfg *config.Config, db *database.DB, version string) *Server {
 		tokenRefresher:    NewTokenRefresher(),                   // 令牌刷新锁
 		rateLimiter:       ratelimit.NewDualLimiter(time.Minute), // 双重限流器（60秒滑动窗口）
 		suspendedCacheTTL: 5 * time.Minute,                       // 账号封控状态缓存 5 分钟
+		promptCache:       cache.NewPromptCache(5 * time.Minute), // Prompt 缓存追踪器（5 分钟 TTL，与 Claude 官方一致）
 	}
 	s.reloadProxyPool() // 初始化代理池
 	s.startLogWorker()

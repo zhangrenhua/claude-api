@@ -263,7 +263,7 @@ func TestCountClaudeInputTokens(t *testing.T) {
 	fmt.Println("\n=== Claude 输入 Token 测试 ===")
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokens := countClaudeInputTokens(tt.req)
+			tokens, _, _ := countClaudeInputTokens(tt.req)
 			status := "✓"
 			if tokens < tt.minToken || tokens > tt.maxToken {
 				status = "✗"
@@ -741,7 +741,7 @@ func TestComplexContentBlocks(t *testing.T) {
 	fmt.Println("\n=== 复杂内容块测试 ===")
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokens := countClaudeInputTokens(tt.req)
+			tokens, _, _ := countClaudeInputTokens(tt.req)
 			status := "✓"
 			if tokens < tt.minToken || tokens > tt.maxToken {
 				status = "✗"
@@ -800,7 +800,7 @@ func TestSystemPromptVariants(t *testing.T) {
 	fmt.Println("\n=== System Prompt 变体测试 ===")
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tokens := countClaudeInputTokens(tt.req)
+			tokens, _, _ := countClaudeInputTokens(tt.req)
 			status := "✓"
 			if tokens < tt.minToken || tokens > tt.maxToken {
 				status = "✗"

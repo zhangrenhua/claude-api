@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"claude-api/internal/amazonq"
 	"claude-api/internal/auth"
+	"claude-api/internal/cache"
 	"claude-api/internal/claude"
 	"claude-api/internal/database"
 	"claude-api/internal/logger"
@@ -2141,8 +2142,14 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		conversationID = uuid.New().String()
 	}
 
-	// 预估输入 tokens，便于日志与 SSE 元数据
-	inputTokens := countClaudeInputTokens(&req)
+	// 预估输入 tokens，同时收集 cache_control 断点信息
+	inputTokens, cachedTokens, cacheBreakpoints := countClaudeInputTokens(&req)
+
+	// 计算缓存 token（本地模拟 prompt caching，cache 计数打 3 折）
+	cacheInfo := s.promptCache.CalcCacheTokens(inputTokens, cachedTokens, cacheBreakpoints)
+	if cacheInfo.CacheCreationInputTokens > 0 || cacheInfo.CacheReadInputTokens > 0 {
+		logger.Debug("[Prompt Cache] input=%d, cache_creation=%d, cache_read=%d", cacheInfo.InputTokens, cacheInfo.CacheCreationInputTokens, cacheInfo.CacheReadInputTokens)
+	}
 
 	// 上下文压缩检查（从数据库读取设置）
 	if s.compressor != nil {
@@ -2164,7 +2171,8 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 				logger.Warn("[智能压缩] 压缩失败: %v", compressErr)
 			} else if compressedReq != nil {
 				req = *compressedReq
-				inputTokens = countClaudeInputTokens(&req)
+				inputTokens, cachedTokens, cacheBreakpoints = countClaudeInputTokens(&req)
+				cacheInfo = s.promptCache.CalcCacheTokens(inputTokens, cachedTokens, cacheBreakpoints)
 				logger.Info("[智能压缩] 完成 - Token: %d, 消息数: %d", inputTokens, len(req.Messages))
 				c.Set("compression_retried", true) // 标记已压缩，避免超限时重复压缩
 			}
@@ -2251,7 +2259,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 
 						// 如果是上下文超出错误，尝试压缩后重试
 						if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
-							inputTokens = countClaudeInputTokens(&req)
+							inputTokens, cachedTokens, cacheBreakpoints = countClaudeInputTokens(&req)
 							logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
 
 							// 尝试压缩后重试（仅一次，需开启智能压缩）
@@ -2265,7 +2273,8 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 									})
 								if compressErr == nil && compressedReq != nil {
 									req = *compressedReq
-									inputTokens = countClaudeInputTokens(&req)
+									inputTokens, cachedTokens, cacheBreakpoints = countClaudeInputTokens(&req)
+									cacheInfo = s.promptCache.CalcCacheTokens(inputTokens, cachedTokens, cacheBreakpoints)
 									logger.Info("[自动压缩重试] 压缩完成 - Token: %d, 消息数: %d，重新发送请求", inputTokens, len(req.Messages))
 									// 重置重试状态，用当前账号重新发送
 									triedIDs = triedIDs[:len(triedIDs)-1]
@@ -2330,23 +2339,25 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		// 标准 Claude API 使用 ClaudeStreamHandler（标准 Claude SSE 格式）
 		isThinking := req.Thinking != nil
 		if isConsoleMode {
-			s.handleConsoleStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking)
+			s.handleConsoleStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
 		} else {
-			s.handleClaudeStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking)
+			s.handleClaudeStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
 		}
 	} else {
-		s.handleClaudeNonStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, acc, len(req.Messages), inputTokens)
+		s.handleClaudeNonStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, acc, len(req.Messages), inputTokens, cacheInfo)
 	}
 }
 
 // handleConsoleStreamResponse 处理控制台流式响应（使用前端期望的自定义 SSE 格式）
-func (s *Server) handleConsoleStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, msgCount int, acc *models.Account, inputTokens int, isThinking bool) {
+func (s *Server) handleConsoleStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, msgCount int, acc *models.Account, inputTokens int, isThinking bool, cacheInfo cache.CacheTokenInfo) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
 	// 使用 UnifiedStreamHandler 输出前端期望的 SSE 格式（meta, answer_delta, thinking_delta, done）
-	handler := stream.NewUnifiedStreamHandler(model, conversationID, inputTokens)
+	handler := stream.NewUnifiedStreamHandler(model, conversationID, cacheInfo.InputTokens)
+	handler.CacheCreationInputTokens = cacheInfo.CacheCreationInputTokens
+	handler.CacheReadInputTokens = cacheInfo.CacheReadInputTokens
 	parser := stream.NewEventStreamParser()
 
 	reader := bufio.NewReader(resp.Body)
@@ -2411,15 +2422,18 @@ func (s *Server) handleConsoleStreamResponse(c *gin.Context, resp *http.Response
 	})
 }
 
-func (s *Server) handleClaudeStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, msgCount int, acc *models.Account, inputTokens int, isThinking bool) {
+func (s *Server) handleClaudeStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, msgCount int, acc *models.Account, inputTokens int, isThinking bool, cacheInfo cache.CacheTokenInfo) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("x-conversation-id", conversationID)
 
 	// 使用 ClaudeStreamHandler 输出标准 Claude SSE 格式
-	handler := stream.NewClaudeStreamHandler(model, inputTokens)
+	// InputTokens 设为非缓存部分（符合 Claude API 标准：input_tokens 不含缓存 token）
+	handler := stream.NewClaudeStreamHandler(model, cacheInfo.InputTokens)
 	handler.ConversationID = conversationID
+	handler.CacheCreationInputTokens = cacheInfo.CacheCreationInputTokens
+	handler.CacheReadInputTokens = cacheInfo.CacheReadInputTokens
 	parser := stream.NewEventStreamParser()
 
 	reader := bufio.NewReader(resp.Body)
@@ -2490,7 +2504,7 @@ func (s *Server) handleClaudeStreamResponse(c *gin.Context, resp *http.Response,
 	})
 }
 
-func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, acc *models.Account, msgCount int, inputTokens int) {
+func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Response, model, conversationID, clientIP string, startTime time.Time, acc *models.Account, msgCount int, inputTokens int, cacheInfo cache.CacheTokenInfo) {
 	// 确保响应体被关闭
 	defer resp.Body.Close()
 
@@ -2656,10 +2670,12 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		"content":         content,
 		"stop_reason":     stopReason,
 		"conversation_id": conversationID,
-		"conversationId":  conversationID,
+		"conversationId": conversationID,
 		"usage": map[string]interface{}{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
+			"input_tokens":                 cacheInfo.InputTokens,
+			"output_tokens":                outputTokens,
+			"cache_creation_input_tokens":  cacheInfo.CacheCreationInputTokens,
+			"cache_read_input_tokens":      cacheInfo.CacheReadInputTokens,
 		},
 	}
 
@@ -2829,7 +2845,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 							})
 						if compressErr == nil && compressedReq != nil {
 							claudeReq = compressedReq
-							inputTokens = countClaudeInputTokens(claudeReq)
+							inputTokens, _, _ = countClaudeInputTokens(claudeReq)
 							aqPayload2, convErr2 := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
 							if convErr2 == nil {
 								resp2, err2 := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
@@ -3135,15 +3151,37 @@ func estimateTokens(text string) int {
 	return tokenizer.CountTokens(text)
 }
 
-// countClaudeInputTokens 计算 Claude 请求的输入 token
-// 使用 Claude 专用 tokenizer (基于 ai-tokenizer)，准确率约 97%+
-func countClaudeInputTokens(req *models.ClaudeRequest) int {
+// countClaudeInputTokens 计算 Claude 请求的输入 token，同时收集 cache_control 断点信息
+// 返回: 总 token 数, 带缓存标记的 token 数, 缓存断点列表
+func countClaudeInputTokens(req *models.ClaudeRequest) (int, int, []cache.CacheBreakpoint) {
 	total := 0
+	cachedTokens := 0
+	var breakpoints []cache.CacheBreakpoint
+
 	// 计算 system prompt（Claude 的 system prompt 有额外开销）
 	if system, ok := req.System.(string); ok && system != "" {
 		total += tokenizer.CountTokens(system)
 		total += 3 // system prompt 格式开销
+	} else if systemBlocks, ok := req.System.([]interface{}); ok {
+		for _, block := range systemBlocks {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				text, _ := blockMap["text"].(string)
+				if text != "" {
+					tokens := tokenizer.CountTokens(text)
+					total += tokens
+					if cache.HasCacheControl(blockMap) {
+						cachedTokens += tokens
+						breakpoints = append(breakpoints, cache.CacheBreakpoint{
+							ContentHash: cache.HashContent(text),
+							Tokens:      tokens,
+						})
+					}
+				}
+			}
+		}
+		total += 3 // system prompt 格式开销
 	}
+
 	// 计算消息内容
 	for _, msg := range req.Messages {
 		total += 4 // role + 格式开销（每条消息的角色和结构化开销）
@@ -3152,16 +3190,40 @@ func countClaudeInputTokens(req *models.ClaudeRequest) int {
 		} else if contentList, ok := msg.Content.([]interface{}); ok {
 			for _, block := range contentList {
 				if blockMap, ok := block.(map[string]interface{}); ok {
-					if blockMap["type"] == "text" {
+					blockType, _ := blockMap["type"].(string)
+					var tokens int
+					if blockType == "text" {
 						if text, ok := blockMap["text"].(string); ok {
-							total += tokenizer.CountTokens(text)
+							tokens = tokenizer.CountTokens(text)
 						}
+					} else if blockType == "tool_result" {
+						if content, ok := blockMap["content"].(string); ok {
+							tokens = tokenizer.CountTokens(content)
+						} else if contentList, ok := blockMap["content"].([]interface{}); ok {
+							for _, item := range contentList {
+								if itemMap, ok := item.(map[string]interface{}); ok {
+									if text, ok := itemMap["text"].(string); ok {
+										tokens += tokenizer.CountTokens(text)
+									}
+								}
+							}
+						}
+					}
+					total += tokens
+					if tokens > 0 && cache.HasCacheControl(blockMap) {
+						cachedTokens += tokens
+						// 用 json.Marshal 生成确定性的 hash 输入（map 的 %v 输出顺序不确定）
+						blockJSON, _ := json.Marshal(blockMap)
+						breakpoints = append(breakpoints, cache.CacheBreakpoint{
+							ContentHash: cache.HashContent(string(blockJSON)),
+							Tokens:      tokens,
+						})
 					}
 				}
 			}
 		}
 	}
-	return total
+	return total, cachedTokens, breakpoints
 }
 
 // countOpenAIInputTokens 计算 OpenAI 格式请求的输入 token

@@ -69,7 +69,13 @@ func sseFormat(eventType string, data interface{}) string {
 }
 
 // BuildMessageStart 构建 message_start 事件
-func BuildMessageStart(conversationID, model string, inputTokens int) string {
+// cacheTokens 可选：[0]=cache_creation_input_tokens, [1]=cache_read_input_tokens
+func BuildMessageStart(conversationID, model string, inputTokens int, cacheTokens ...int) string {
+	usage := map[string]int{"input_tokens": inputTokens, "output_tokens": 0}
+	if len(cacheTokens) >= 2 {
+		usage["cache_creation_input_tokens"] = cacheTokens[0]
+		usage["cache_read_input_tokens"] = cacheTokens[1]
+	}
 	data := map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
@@ -80,7 +86,7 @@ func BuildMessageStart(conversationID, model string, inputTokens int) string {
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage":         map[string]int{"input_tokens": inputTokens, "output_tokens": 0},
+			"usage":         usage,
 		},
 	}
 	return sseFormat("message_start", data)
@@ -227,6 +233,9 @@ type ClaudeStreamHandler struct {
 	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
 	ContentCharCount   int
 	PendingKiroBuffer  string
+	// 缓存 token 信息（本地计算）
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }
 
 // NewClaudeStreamHandler 创建 Claude 流处理器
@@ -253,7 +262,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 	case "initial-response":
 		if !h.MessageStartSent {
 			// 直接使用初始化时生成的随机 ID，不从 AWS 响应获取（AWS 返回的可能为空或重复）
-			events = append(events, BuildMessageStart(h.ConversationID, h.Model, h.InputTokens))
+			events = append(events, BuildMessageStart(h.ConversationID, h.Model, h.InputTokens, h.CacheCreationInputTokens, h.CacheReadInputTokens))
 			h.MessageStartSent = true
 			events = append(events, BuildPing())
 		}

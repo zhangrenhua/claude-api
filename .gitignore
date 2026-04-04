@@ -13,8 +13,9 @@
 logs/
 *.log
 
-# 缓存目录
+# 缓存目录（排除 internal/cache 源码）
 cache/
+!internal/cache/
 
 # 编译输出
 dist/

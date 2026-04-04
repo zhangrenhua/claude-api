@@ -34,6 +34,9 @@ type UnifiedStreamHandler struct {
 	// 累计内容字符数，用于前100字符 Kiro->Claude 替换
 	contentCharCount  int
 	pendingKiroBuffer string
+	// 缓存 token 信息（本地计算）
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
 }
 
 func NewUnifiedStreamHandler(model string, conversationID string, inputTokens int) *UnifiedStreamHandler {
@@ -53,12 +56,19 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 	case "initial-response":
 		if !h.metaSent {
 			// 直接使用初始化时生成的随机 ID，不从 AWS 响应获取（AWS 返回的可能为空或重复）
-			events = append(events, buildUnifiedEvent("meta", map[string]interface{}{
+			meta := map[string]interface{}{
 				"type":            "meta",
 				"conversation_id": h.ConversationID,
 				"model":           h.Model,
 				"input_tokens":    h.InputTokens,
-			}))
+			}
+			if h.CacheCreationInputTokens > 0 {
+				meta["cache_creation_input_tokens"] = h.CacheCreationInputTokens
+			}
+			if h.CacheReadInputTokens > 0 {
+				meta["cache_read_input_tokens"] = h.CacheReadInputTokens
+			}
+			events = append(events, buildUnifiedEvent("meta", meta))
 			h.metaSent = true
 		}
 
