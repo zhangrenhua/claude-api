@@ -322,6 +322,13 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 	// 1. 转换工具
 	var aqTools []models.Tool
 	for _, t := range req.Tools {
+		// 跳过 Anthropic 内置工具（如 web_search、code_execution 等）
+		// 这些工具的 input_schema 为 null 且由 Anthropic 服务端处理，Amazon Q 不支持
+		if t.InputSchema == nil {
+			logger.Debug("[消息转换] 跳过内置工具（无 input_schema）: %s", t.Name)
+			continue
+		}
+
 		desc := t.Description
 		// 处理空描述（Amazon Q 不接受空的 description）
 		if desc == "" {
@@ -334,11 +341,9 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		}
 		// 清理 inputSchema 中值为 null 的字段（如 "required": null），Amazon Q 不接受
 		inputSchema := t.InputSchema
-		if inputSchema != nil {
-			for key, val := range inputSchema {
-				if val == nil {
-					delete(inputSchema, key)
-				}
+		for key, val := range inputSchema {
+			if val == nil {
+				delete(inputSchema, key)
 			}
 		}
 
