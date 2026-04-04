@@ -250,16 +250,18 @@ func TestConvertClaudeToAmazonQ_ToolResultWithUserText(t *testing.T) {
 // TestDetermineChatTriggerType 测试 chatTriggerType 动态判断
 func TestDetermineChatTriggerType(t *testing.T) {
 	tests := []struct {
-		name     string
-		req      *models.ClaudeRequest
-		expected string
+		name             string
+		req              *models.ClaudeRequest
+		filteredToolCount int
+		expected         string
 	}{
 		{
 			name: "无工具 - MANUAL",
 			req: &models.ClaudeRequest{
 				Messages: []models.ClaudeMessage{{Role: "user", Content: "Hello"}},
 			},
-			expected: "MANUAL",
+			filteredToolCount: 0,
+			expected:          "MANUAL",
 		},
 		{
 			name: "有工具但无 tool_choice - MANUAL",
@@ -267,7 +269,8 @@ func TestDetermineChatTriggerType(t *testing.T) {
 				Messages: []models.ClaudeMessage{{Role: "user", Content: "Hello"}},
 				Tools:    []models.ClaudeTool{{Name: "test_tool"}},
 			},
-			expected: "MANUAL",
+			filteredToolCount: 1,
+			expected:          "MANUAL",
 		},
 		{
 			name: "有工具且 tool_choice=any - AUTO",
@@ -276,7 +279,8 @@ func TestDetermineChatTriggerType(t *testing.T) {
 				Tools:      []models.ClaudeTool{{Name: "test_tool"}},
 				ToolChoice: map[string]interface{}{"type": "any"},
 			},
-			expected: "AUTO",
+			filteredToolCount: 1,
+			expected:          "AUTO",
 		},
 		{
 			name: "有工具且 tool_choice=tool - AUTO",
@@ -285,13 +289,24 @@ func TestDetermineChatTriggerType(t *testing.T) {
 				Tools:      []models.ClaudeTool{{Name: "test_tool"}},
 				ToolChoice: map[string]interface{}{"type": "tool", "name": "test_tool"},
 			},
-			expected: "AUTO",
+			filteredToolCount: 1,
+			expected:          "AUTO",
+		},
+		{
+			name: "原始有工具但全部被过滤 - MANUAL",
+			req: &models.ClaudeRequest{
+				Messages:   []models.ClaudeMessage{{Role: "user", Content: "Hello"}},
+				Tools:      []models.ClaudeTool{{Name: "web_search"}},
+				ToolChoice: map[string]interface{}{"type": "tool", "name": "web_search"},
+			},
+			filteredToolCount: 0,
+			expected:          "MANUAL",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := determineChatTriggerType(tt.req)
+			result := determineChatTriggerType(tt.req, tt.filteredToolCount)
 			if result != tt.expected {
 				t.Errorf("expected %s, got %s", tt.expected, result)
 			}

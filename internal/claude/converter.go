@@ -280,9 +280,9 @@ func extractSystemText(system interface{}) string {
 	return ""
 }
 
-// determineChatTriggerType 根据 tool_choice 动态判断触发类型
-func determineChatTriggerType(req *models.ClaudeRequest) string {
-	if len(req.Tools) == 0 {
+// determineChatTriggerType 根据 tool_choice 和过滤后的工具列表动态判断触发类型
+func determineChatTriggerType(req *models.ClaudeRequest, filteredToolCount int) string {
+	if filteredToolCount == 0 {
 		return "MANUAL"
 	}
 
@@ -356,6 +356,12 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 				},
 			},
 		})
+	}
+
+	// 日志记录被过滤的内置工具
+	if len(req.Tools) > 0 && len(aqTools) < len(req.Tools) {
+		skipped := len(req.Tools) - len(aqTools)
+		logger.Info("[消息转换] 已过滤 %d 个上游不支持的内置工具，剩余可用工具: %d", skipped, len(aqTools))
 	}
 
 	// 2. 处理最后一条消息
@@ -492,7 +498,7 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 			ConversationID:  conversationID,
 			History:         fullHistory,
 			CurrentMessage:  models.CurrentMessage{UserInputMessage: userInputMsg},
-			ChatTriggerType: determineChatTriggerType(req), // 动态判断
+			ChatTriggerType: determineChatTriggerType(req, len(aqTools)), // 基于过滤后的工具列表判断
 		},
 	}
 
