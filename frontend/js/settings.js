@@ -44,6 +44,9 @@ export const settingsMixin = {
                 compressionEnabled: false,
                 compressionModel: 'claude-sonnet-4-5-20250929',
                 supportedCompressionModels: [],
+                compressionTokenLimit: 0,
+                compressionMessageLimit: 0,
+                compressionKeepMessages: 0,
                         // 强制模型配置
                         forceModelEnabled: false,
                         forceModel: '',
@@ -209,6 +212,9 @@ export const settingsMixin = {
                         compressionEnabled: data.compressionEnabled || false,
                         compressionModel: data.compressionModel || 'claude-sonnet-4-5-20250929',
                         supportedCompressionModels: data.supportedCompressionModels || [],
+                        compressionTokenLimit: data.compressionTokenLimit || 0,
+                        compressionMessageLimit: data.compressionMessageLimit || 0,
+                        compressionKeepMessages: data.compressionKeepMessages || 0,
                         // 强制模型配置
                         forceModelEnabled: data.forceModelEnabled || false,
                         forceModel: data.forceModel || '',

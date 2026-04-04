@@ -1581,6 +1581,21 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                     </div>
                                     <small class="form-hint">用于生成对话摘要的模型，推荐使用 Haiku 平衡速度与质量</small>
                                 </div>
+                                <div class="form-group" v-if="settingsData.compressionEnabled">
+                                    <label class="form-label">Token 阈值</label>
+                                    <input type="number" class="form-input" v-model.number="settingsData.compressionTokenLimit" min="0" step="10000" placeholder="0 表示使用默认值 (180000)">
+                                    <small class="form-hint">对话 Token 数超过此值时触发压缩，0 使用默认值 180000。VS Code Claude Code 建议设为 120000</small>
+                                </div>
+                                <div class="form-group" v-if="settingsData.compressionEnabled">
+                                    <label class="form-label">消息数阈值</label>
+                                    <input type="number" class="form-input" v-model.number="settingsData.compressionMessageLimit" min="0" step="10" placeholder="0 表示使用默认值 (100)">
+                                    <small class="form-hint">对话消息数超过此值时触发压缩，0 使用默认值 100。VS Code Claude Code 建议设为 60</small>
+                                </div>
+                                <div class="form-group" v-if="settingsData.compressionEnabled">
+                                    <label class="form-label">保留消息数</label>
+                                    <input type="number" class="form-input" v-model.number="settingsData.compressionKeepMessages" min="0" step="2" placeholder="0 表示使用默认值 (6)">
+                                    <small class="form-hint">压缩时保留最近的消息数量，0 使用默认值 6。值越大保留越多近期上下文，VS Code Claude Code 建议设为 20</small>
+                                </div>
 
                                 <!-- 分隔线 -->
                                 <div class="settings-divider" style="margin: 16px 0; border-top: 1px solid var(--color-border);"></div>
