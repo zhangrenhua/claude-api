@@ -339,11 +339,23 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 			desc = desc[:10000]
 			logger.Debug("[消息转换] 工具描述超长已截断: %s", t.Name)
 		}
-		// 清理 inputSchema 中值为 null 的字段（如 "required": null），Amazon Q 不接受
+		// 清理 inputSchema 中 Amazon Q 不接受的字段
 		inputSchema := t.InputSchema
 		for key, val := range inputSchema {
 			if val == nil {
+				// 值为 null（如 "required": null）
 				delete(inputSchema, key)
+				continue
+			}
+			// 空数组（如 "required": []）
+			if arr, ok := val.([]interface{}); ok && len(arr) == 0 {
+				delete(inputSchema, key)
+				continue
+			}
+			// 空对象（如 "properties": {}）
+			if obj, ok := val.(map[string]interface{}); ok && len(obj) == 0 {
+				delete(inputSchema, key)
+				continue
 			}
 		}
 
