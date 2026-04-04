@@ -91,10 +91,21 @@ func Init() error {
 
 	InfoLogger.Println("日志系统初始化成功，日志文件: " + logFileName)
 
-	// 清理过期日志文件
+	// 清理过期日志文件（启动时立即执行一次，之后每天凌晨执行）
 	go cleanOldLogs(logDir, 7)
+	go scheduleDailyCleanup(logDir, 7)
 
 	return nil
+}
+
+// scheduleDailyCleanup 每天凌晨 3 点执行日志清理
+func scheduleDailyCleanup(logDir string, retainDays int) {
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 3, 0, 0, 0, now.Location())
+		time.Sleep(next.Sub(now))
+		cleanOldLogs(logDir, retainDays)
+	}
 }
 
 // cleanOldLogs 清理超过 retainDays 天的日志文件
