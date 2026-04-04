@@ -2094,6 +2094,117 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 	// 	return
 	// }
 
+	// 预处理工具列表：剔除上游不支持的工具，限制工具数量
+	if len(req.Tools) > 0 {
+		originalToolCount := len(req.Tools)
+		var filteredTools []models.ClaudeTool
+
+		// 1. 剔除内置工具（web_search, code_execution 等，无 input_schema）
+		for _, t := range req.Tools {
+			if t.InputSchema == nil {
+				logger.Info("[工具预处理] 剔除内置工具（上游不支持）: %s", t.Name)
+				continue
+			}
+			filteredTools = append(filteredTools, t)
+		}
+
+		// 2. 工具数量超限：优先保留核心工具，裁剪 MCP 工具
+		const maxTools = 40
+		if len(filteredTools) > maxTools {
+			var coreTools, mcpTools []models.ClaudeTool
+			for _, t := range filteredTools {
+				if strings.HasPrefix(t.Name, "mcp__") || strings.HasPrefix(t.Name, "mcp_") {
+					mcpTools = append(mcpTools, t)
+				} else {
+					coreTools = append(coreTools, t)
+				}
+			}
+
+			if len(coreTools) >= maxTools {
+				filteredTools = coreTools[:maxTools]
+				logger.Info("[工具预处理] 核心工具超限，截断为 %d 个，丢弃 %d 个核心工具和 %d 个 MCP 工具",
+					maxTools, len(coreTools)-maxTools, len(mcpTools))
+			} else {
+				remaining := maxTools - len(coreTools)
+				filteredTools = append(coreTools, mcpTools[:remaining]...)
+				logger.Info("[工具预处理] 保留 %d 个核心工具 + %d 个 MCP 工具（丢弃 %d 个 MCP 工具）",
+					len(coreTools), remaining, len(mcpTools)-remaining)
+			}
+		}
+
+		// 3. 工具定义总大小限制：超过阈值时从 MCP 工具开始裁剪
+		const maxToolsSize = 100 * 1024 // 100KB
+		totalSize := 0
+		for _, t := range filteredTools {
+			schemaBytes, _ := json.Marshal(t.InputSchema)
+			totalSize += len(t.Name) + len(t.Description) + len(schemaBytes)
+		}
+		if totalSize > maxToolsSize {
+			// 分离核心工具和 MCP 工具，优先从 MCP 尾部裁剪
+			var coreIdx, mcpIdx []int
+			for i, t := range filteredTools {
+				if strings.HasPrefix(t.Name, "mcp__") || strings.HasPrefix(t.Name, "mcp_") {
+					mcpIdx = append(mcpIdx, i)
+				} else {
+					coreIdx = append(coreIdx, i)
+				}
+			}
+			// 从 MCP 工具末尾开始移除，直到总大小降到阈值内
+			removeSet := make(map[int]bool)
+			for i := len(mcpIdx) - 1; i >= 0 && totalSize > maxToolsSize; i-- {
+				idx := mcpIdx[i]
+				t := filteredTools[idx]
+				schemaBytes, _ := json.Marshal(t.InputSchema)
+				totalSize -= len(t.Name) + len(t.Description) + len(schemaBytes)
+				removeSet[idx] = true
+			}
+			// 如果 MCP 全删完还超限，从核心工具末尾继续删
+			for i := len(coreIdx) - 1; i >= 0 && totalSize > maxToolsSize; i-- {
+				idx := coreIdx[i]
+				t := filteredTools[idx]
+				schemaBytes, _ := json.Marshal(t.InputSchema)
+				totalSize -= len(t.Name) + len(t.Description) + len(schemaBytes)
+				removeSet[idx] = true
+			}
+			if len(removeSet) > 0 {
+				var trimmed []models.ClaudeTool
+				for i, t := range filteredTools {
+					if !removeSet[i] {
+						trimmed = append(trimmed, t)
+					}
+				}
+				logger.Info("[工具预处理] 工具定义总大小超限，裁剪 %d 个工具（剩余 %d 个，约 %d KB）",
+					len(removeSet), len(trimmed), totalSize/1024)
+				filteredTools = trimmed
+			}
+		}
+
+		// 4. 如果 tool_choice 指向已被剔除的工具，清除 tool_choice
+		if req.ToolChoice != nil && len(filteredTools) < originalToolCount {
+			if tc, ok := req.ToolChoice.(map[string]interface{}); ok {
+				if toolName, exists := tc["name"].(string); exists {
+					found := false
+					for _, t := range filteredTools {
+						if t.Name == toolName {
+							found = true
+							break
+						}
+					}
+					if !found {
+						logger.Info("[工具预处理] tool_choice 指向已剔除的工具 %s，清除 tool_choice", toolName)
+						req.ToolChoice = nil
+					}
+				}
+			}
+		}
+
+		if len(filteredTools) < originalToolCount {
+			logger.Info("[工具预处理] 工具列表: %d -> %d（剔除 %d 个）",
+				originalToolCount, len(filteredTools), originalToolCount-len(filteredTools))
+		}
+		req.Tools = filteredTools
+	}
+
 	// 强制模型替换逻辑（haiku模型不替换）@author ygw
 	var originalModel string
 	settings, _ := s.db.GetSettings(c.Request.Context())
