@@ -90,7 +90,42 @@ func Init() error {
 	DebugLogger = log.New(broadcastW, "[DEBUG] ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	InfoLogger.Println("日志系统初始化成功，日志文件: " + logFileName)
+
+	// 清理过期日志文件
+	go cleanOldLogs(logDir, 7)
+
 	return nil
+}
+
+// cleanOldLogs 清理超过 retainDays 天的日志文件
+func cleanOldLogs(logDir string, retainDays int) {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -retainDays)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// 只处理 server_yyyy-mm-dd.log 格式的文件
+		if len(name) != 21 || name[:7] != "server_" || name[17:] != ".log" {
+			continue
+		}
+		dateStr := name[7:17] // yyyy-mm-dd
+		fileDate, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue
+		}
+		if fileDate.Before(cutoff) {
+			path := filepath.Join(logDir, name)
+			if err := os.Remove(path); err == nil {
+				fmt.Printf("[INFO] 清理过期日志: %s\n", name)
+			}
+		}
+	}
 }
 
 // CloseSubscribers 关闭所有订阅者的 channel（用于优雅关闭时先断开 SSE 连接）
