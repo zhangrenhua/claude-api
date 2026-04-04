@@ -280,23 +280,10 @@ func extractSystemText(system interface{}) string {
 	return ""
 }
 
-// determineChatTriggerType 根据 tool_choice 和过滤后的工具列表动态判断触发类型
+// determineChatTriggerType 根据过滤后的工具列表判断触发类型
+// 注意：始终使用 MANUAL，Amazon Q 对 AUTO 的支持不稳定，
+// 且 Anthropic 的 tool_choice 语义与 Amazon Q 的 chatTriggerType 不对等
 func determineChatTriggerType(req *models.ClaudeRequest, filteredToolCount int) string {
-	if filteredToolCount == 0 {
-		return "MANUAL"
-	}
-
-	// 检查 tool_choice 配置
-	if req.ToolChoice != nil {
-		if tc, ok := req.ToolChoice.(map[string]interface{}); ok {
-			if tcType, exists := tc["type"].(string); exists {
-				if tcType == "any" || tcType == "tool" {
-					return "AUTO"
-				}
-			}
-		}
-	}
-
 	return "MANUAL"
 }
 

@@ -247,7 +247,7 @@ func TestConvertClaudeToAmazonQ_ToolResultWithUserText(t *testing.T) {
 	}
 }
 
-// TestDetermineChatTriggerType 测试 chatTriggerType 动态判断
+// TestDetermineChatTriggerType 测试 chatTriggerType 始终返回 MANUAL
 func TestDetermineChatTriggerType(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -273,24 +273,24 @@ func TestDetermineChatTriggerType(t *testing.T) {
 			expected:          "MANUAL",
 		},
 		{
-			name: "有工具且 tool_choice=any - AUTO",
+			name: "有工具且 tool_choice=any - 仍然 MANUAL",
 			req: &models.ClaudeRequest{
 				Messages:   []models.ClaudeMessage{{Role: "user", Content: "Hello"}},
 				Tools:      []models.ClaudeTool{{Name: "test_tool"}},
 				ToolChoice: map[string]interface{}{"type": "any"},
 			},
 			filteredToolCount: 1,
-			expected:          "AUTO",
+			expected:          "MANUAL",
 		},
 		{
-			name: "有工具且 tool_choice=tool - AUTO",
+			name: "有工具且 tool_choice=tool - 仍然 MANUAL",
 			req: &models.ClaudeRequest{
 				Messages:   []models.ClaudeMessage{{Role: "user", Content: "Hello"}},
 				Tools:      []models.ClaudeTool{{Name: "test_tool"}},
 				ToolChoice: map[string]interface{}{"type": "tool", "name": "test_tool"},
 			},
 			filteredToolCount: 1,
-			expected:          "AUTO",
+			expected:          "MANUAL",
 		},
 		{
 			name: "原始有工具但全部被过滤 - MANUAL",
