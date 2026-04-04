@@ -56,8 +56,11 @@ type Settings struct {
 	ProxyPoolEnabled   bool   `json:"proxyPoolEnabled"`   // 是否启用代理池
 	ProxyPoolStrategy  string `json:"proxyPoolStrategy"`  // 代理选择策略: round_robin, random, weighted
 	// 智能压缩相关配置
-	CompressionEnabled bool   `json:"compressionEnabled"` // 是否启用智能压缩
-	CompressionModel   string `json:"compressionModel"`   // 压缩使用的模型
+	CompressionEnabled      bool   `json:"compressionEnabled"`      // 是否启用智能压缩
+	CompressionModel        string `json:"compressionModel"`        // 压缩使用的模型
+	CompressionTokenLimit   int    `json:"compressionTokenLimit"`   // 触发压缩的 token 阈值（0 使用默认值 180000）
+	CompressionMessageLimit int    `json:"compressionMessageLimit"` // 触发压缩的消息数阈��（0 使用默认值 100）
+	CompressionKeepMessages int    `json:"compressionKeepMessages"` // 压缩时保留最近的消息数（0 使用默认值 6）
 	// 公告配置
 	AnnouncementEnabled bool   `json:"announcementEnabled"` // 是否启用公告
 	AnnouncementText    string `json:"announcementText"`    // 公告内容
@@ -91,8 +94,11 @@ type SettingsUpdate struct {
 	ProxyPoolEnabled  *bool   `json:"proxyPoolEnabled"`
 	ProxyPoolStrategy *string `json:"proxyPoolStrategy"`
 	// 智能压缩相关配置
-	CompressionEnabled *bool   `json:"compressionEnabled"`
-	CompressionModel   *string `json:"compressionModel"`
+	CompressionEnabled      *bool   `json:"compressionEnabled"`
+	CompressionModel        *string `json:"compressionModel"`
+	CompressionTokenLimit   *int    `json:"compressionTokenLimit"`
+	CompressionMessageLimit *int    `json:"compressionMessageLimit"`
+	CompressionKeepMessages *int    `json:"compressionKeepMessages"`
 	// 公告配置
 	AnnouncementEnabled *bool   `json:"announcementEnabled"`
 	AnnouncementText    *string `json:"announcementText"`

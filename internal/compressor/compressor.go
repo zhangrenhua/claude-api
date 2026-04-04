@@ -46,6 +46,38 @@ func (c *Compressor) GetSummaryModel() string {
 	return c.config.SummaryModel
 }
 
+// UpdateConfig 根据设置动态更新压缩配置（值为 0 表示使用默认值）
+// 注意：与 SetSummaryModel 一致，直接写入共享 config，依赖调用方传入的值是幂等的
+func (c *Compressor) UpdateConfig(tokenLimit, messageLimit, keepMessages int) {
+	defaults := DefaultConfig()
+
+	newTokenThreshold := defaults.TokenThreshold
+	if tokenLimit > 0 {
+		newTokenThreshold = tokenLimit
+	}
+
+	newMessageThreshold := defaults.MessageThreshold
+	if messageLimit > 0 {
+		newMessageThreshold = messageLimit
+	}
+
+	newKeepCount := defaults.KeepMessageCount
+	if keepMessages >= 2 {
+		newKeepCount = keepMessages
+	}
+
+	// 值未变化时跳过写入
+	if c.config.TokenThreshold == newTokenThreshold &&
+		c.config.MessageThreshold == newMessageThreshold &&
+		c.config.KeepMessageCount == newKeepCount {
+		return
+	}
+
+	c.config.TokenThreshold = newTokenThreshold
+	c.config.MessageThreshold = newMessageThreshold
+	c.config.KeepMessageCount = newKeepCount
+}
+
 // NeedsCompression 检查是否需要压缩
 // 返回: needsCompress bool, tokenCount int, messageCount int
 func (c *Compressor) NeedsCompression(messages []models.ClaudeMessage, systemPrompt interface{}) (bool, int, int) {

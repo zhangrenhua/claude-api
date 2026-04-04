@@ -197,9 +197,9 @@ func detectToolCallLoop(messages []models.ClaudeMessage, threshold int) error {
 	return nil
 }
 
-// fixOrphanToolResults 修复孤立的 tool_result
+// fixOrphanToolResults 清理孤立的 tool_result
 // 当 user 消息中包含 tool_result 但前面没有 assistant 消息包含对应的 tool_use 时，
-// 自动补充一条 assistant 消息，避免上游拒绝请求
+// 直接移除这些孤立的 tool_result，避免上游拒绝请求
 func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessage {
 	if len(messages) == 0 {
 		return messages
@@ -221,87 +221,42 @@ func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessag
 		}
 	}
 
-	// 查找所有 user 消息中孤立的 tool_result
-	type orphanInfo struct {
-		msgIdx    int
-		toolUseID string
-	}
-	var orphans []orphanInfo
-
-	for i, msg := range messages {
+	// 遍历 user 消息，移除孤立的 tool_result
+	modified := false
+	result := make([]models.ClaudeMessage, 0, len(messages))
+	for _, msg := range messages {
 		if msg.Role == "user" {
 			if blocks, ok := msg.Content.([]interface{}); ok {
+				var cleaned []interface{}
+				removedCount := 0
 				for _, block := range blocks {
 					if m, ok := block.(map[string]interface{}); ok && m["type"] == "tool_result" {
 						if toolUseID, ok := m["tool_use_id"].(string); ok && toolUseID != "" {
 							if !availableToolUseIDs[toolUseID] {
-								orphans = append(orphans, orphanInfo{msgIdx: i, toolUseID: toolUseID})
+								removedCount++
+								continue // 跳过孤立的 tool_result
 							}
 						}
 					}
+					cleaned = append(cleaned, block)
+				}
+				if removedCount > 0 {
+					modified = true
+					logger.Info("[消息修复] 移除 %d 个孤立的 tool_result (无对应 tool_use)", removedCount)
+					if len(cleaned) == 0 {
+						// 整条 user 消息的内容全部被移除，跳过该消息
+						continue
+					}
+					msg.Content = interface{}(cleaned)
 				}
 			}
 		}
+		result = append(result, msg)
 	}
 
-	if len(orphans) == 0 {
+	if !modified {
 		return messages
 	}
-
-	// 按消息索引分组，为每组孤立的 tool_result 在其 user 消息前插入 assistant 消息
-	// 从后往前插入，避免索引偏移
-	result := make([]models.ClaudeMessage, len(messages))
-	copy(result, messages)
-
-	insertedByIdx := make(map[int][]string) // msgIdx -> []toolUseID
-	for _, o := range orphans {
-		insertedByIdx[o.msgIdx] = append(insertedByIdx[o.msgIdx], o.toolUseID)
-	}
-
-	// 收集需要插入的位置，从后往前处理
-	type insertion struct {
-		idx        int
-		toolUseIDs []string
-	}
-	var insertions []insertion
-	for idx, ids := range insertedByIdx {
-		insertions = append(insertions, insertion{idx: idx, toolUseIDs: ids})
-	}
-	// 从后往前排序
-	for i := 0; i < len(insertions); i++ {
-		for j := i + 1; j < len(insertions); j++ {
-			if insertions[j].idx > insertions[i].idx {
-				insertions[i], insertions[j] = insertions[j], insertions[i]
-			}
-		}
-	}
-
-	for _, ins := range insertions {
-		// 构建 assistant 消息，包含对应的 tool_use 块
-		var toolUseBlocks []interface{}
-		for _, toolUseID := range ins.toolUseIDs {
-			toolUseBlocks = append(toolUseBlocks, map[string]interface{}{
-				"type":  "tool_use",
-				"id":    toolUseID,
-				"name":  "unknown_tool",
-				"input": map[string]interface{}{},
-			})
-		}
-		assistantMsg := models.ClaudeMessage{
-			Role:    "assistant",
-			Content: interface{}(toolUseBlocks),
-		}
-
-		logger.Info("[消息修复] 为 %d 个孤立的 tool_result 补充 assistant 消息 (消息索引: %d)", len(ins.toolUseIDs), ins.idx)
-
-		// 在 user 消息前插入 assistant 消息
-		newResult := make([]models.ClaudeMessage, 0, len(result)+1)
-		newResult = append(newResult, result[:ins.idx]...)
-		newResult = append(newResult, assistantMsg)
-		newResult = append(newResult, result[ins.idx:]...)
-		result = newResult
-	}
-
 	return result
 }
 
@@ -879,9 +834,11 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 				userCtx.ToolResults = toolResults
 			}
 
-			// 与参考项目一致：content 为空但有 toolResults 时使用默认值
+			// content 为空时兜底，避免上游拒绝空内容
 			if textContent == "" && len(toolResults) > 0 {
 				textContent = "Tool results provided."
+			} else if textContent == "" {
+				textContent = "Continue"
 			}
 
 			history = append(history, models.HistoryMessage{
@@ -903,6 +860,25 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 			// 跳过包含错误信息的助手消息
 			if strings.HasPrefix(textContent, "❌ 请求失败:") {
 				continue
+			}
+
+			// 检测连续 assistant 消息，插入 "Continue" 的 user
+			if lastMsgType == "assistant" {
+				history = append(history, models.HistoryMessage{
+					MessageID: fmt.Sprintf("msg-%03d", msgCounter),
+					UserInputMessage: &models.UserInputMessage{
+						Content: "Continue",
+						UserInputMessageContext: models.UserInputMessageContext{
+							EnvState: models.EnvState{
+								OperatingSystem:         getOperatingSystem(),
+								CurrentWorkingDirectory: "/",
+							},
+						},
+						Origin:  "AI_EDITOR",
+						ModelID: modelID,
+					},
+				})
+				msgCounter++
 			}
 
 			entry := models.HistoryMessage{

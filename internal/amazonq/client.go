@@ -45,6 +45,7 @@ type NonRetriableError struct {
 	Message      string // 中文友好提示
 	Hint         string // 解决建议
 	IsRequestErr bool   // true 表示请求本身的问题（换号也没用），false 表示账号问题（可以换号）
+	UpstreamBody string // 上游原始响应体（用于错误诊断）
 }
 
 func (e *NonRetriableError) Error() string {
@@ -426,6 +427,7 @@ func checkNonRetriableError(bodyStr string) *NonRetriableError {
 				Message:      item.Error.Message,
 				Hint:         item.Error.Hint,
 				IsRequestErr: item.Error.IsRequestErr,
+				UpstreamBody: bodyStr,
 			}
 		}
 	}

@@ -102,6 +102,18 @@ func (db *DB) GetSettings(ctx context.Context) (*models.Settings, error) {
 			if s.Value != "" {
 				settings.CompressionModel = s.Value
 			}
+		case "compression_token_limit":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+				settings.CompressionTokenLimit = v
+			}
+		case "compression_message_limit":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+				settings.CompressionMessageLimit = v
+			}
+		case "compression_keep_messages":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
+				settings.CompressionKeepMessages = v
+			}
 		case "announcement_enabled":
 			settings.AnnouncementEnabled = s.Value == "true"
 		case "announcement_text":
@@ -274,6 +286,36 @@ func (db *DB) UpdateSettings(ctx context.Context, updates *models.SettingsUpdate
 
 		if updates.CompressionModel != nil {
 			if err := upsertSetting("compression_model", *updates.CompressionModel); err != nil {
+				return err
+			}
+		}
+
+		if updates.CompressionTokenLimit != nil {
+			v := *updates.CompressionTokenLimit
+			if v < 0 {
+				v = 0
+			}
+			if err := upsertSetting("compression_token_limit", fmt.Sprintf("%d", v)); err != nil {
+				return err
+			}
+		}
+
+		if updates.CompressionMessageLimit != nil {
+			v := *updates.CompressionMessageLimit
+			if v < 0 {
+				v = 0
+			}
+			if err := upsertSetting("compression_message_limit", fmt.Sprintf("%d", v)); err != nil {
+				return err
+			}
+		}
+
+		if updates.CompressionKeepMessages != nil {
+			v := *updates.CompressionKeepMessages
+			if v < 2 {
+				v = 2 // 最少保留 2 条消息
+			}
+			if err := upsertSetting("compression_keep_messages", fmt.Sprintf("%d", v)); err != nil {
 				return err
 			}
 		}

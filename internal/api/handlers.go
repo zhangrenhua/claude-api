@@ -1808,6 +1808,9 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 		"compressionEnabled":         settings.CompressionEnabled,
 		"compressionModel":           compressionModel,
 		"supportedCompressionModels": models.SupportedCompressionModels,
+		"compressionTokenLimit":      settings.CompressionTokenLimit,
+		"compressionMessageLimit":    settings.CompressionMessageLimit,
+		"compressionKeepMessages":    settings.CompressionKeepMessages,
 		// 公告配置
 		"announcementEnabled": settings.AnnouncementEnabled,
 		"announcementText":    settings.AnnouncementText,
@@ -2072,6 +2075,9 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 	// 保存接收到的请求到 in.log（仅调试模式）
 	saveInLog(body, logTimestamp)
 
+	// 保存原始请求体，用于错误诊断转储
+	c.Set("raw_request_body", string(body))
+
 	// 解析请求
 	var req models.ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -2147,6 +2153,8 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			if settings.CompressionModel != "" {
 				s.compressor.SetSummaryModel(settings.CompressionModel)
 			}
+			// 更新压缩器的阈值配置
+			s.compressor.UpdateConfig(settings.CompressionTokenLimit, settings.CompressionMessageLimit, settings.CompressionKeepMessages)
 
 			compressedReq, compressErr := s.compressor.CompressIfNeeded(c.Request.Context(), &req,
 				func(ctx context.Context, content, model string) (string, error) {
@@ -2212,8 +2220,9 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			return
 		}
 
-		// 调试模式：打印转换后的 Amazon Q 请求体
-		if aqPayloadJSON, err := json.MarshalIndent(aqPayload, "", "  "); err == nil {
+		// 序列化转换后的请求体（用于调试日志和错误诊断）
+		aqPayloadJSON, _ := json.MarshalIndent(aqPayload, "", "  ")
+		if len(aqPayloadJSON) > 0 {
 			logger.Debug("[Claude->AmazonQ] 转换后请求体: %s", string(aqPayloadJSON))
 		}
 
@@ -2233,6 +2242,13 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 				if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
 					// 请求本身的错误（如输入过长），换号也没用，直接返回
 					if nrErr.IsRequestErr {
+						// 转储 INVALID_REQUEST 错误的完整诊断信息
+						if nrErr.Code == "INVALID_REQUEST" {
+							rawBody, _ := c.Get("raw_request_body")
+							rawBodyStr, _ := rawBody.(string)
+							logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+						}
+
 						// 如果是上下文超出错误，尝试压缩后重试
 						if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
 							inputTokens = countClaudeInputTokens(&req)
@@ -2689,6 +2705,9 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	c.Set("log_timestamp", logTimestamp)
 	saveInLog(body, logTimestamp)
 
+	// 保存原始请求体，用于错误诊断转储
+	c.Set("raw_request_body", string(body))
+
 	// 解析请求
 	var req models.ChatCompletionRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -2726,6 +2745,8 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 			if settings.CompressionModel != "" {
 				s.compressor.SetSummaryModel(settings.CompressionModel)
 			}
+			// 更新压缩器的阈值配置
+			s.compressor.UpdateConfig(settings.CompressionTokenLimit, settings.CompressionMessageLimit, settings.CompressionKeepMessages)
 
 			// 先转换为 Claude 格式进行压缩检查
 			claudeReqForCheck := convertOpenAIToClaude(&req)
@@ -2778,6 +2799,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	c.Set("is_stream", req.Stream)
 
 	responseID := "chatcmpl-" + uuid.New().String()[:8]
+	aqPayloadJSON, _ := json.MarshalIndent(aqPayload, "", "  ")
 	machineId := s.ensureAccountMachineID(c.Request.Context(), account)
 	resp, err := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
 	if err != nil {
@@ -2786,6 +2808,13 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 		// 检查是否为不可重试错误
 		if amazonq.IsNonRetriable(err) {
 			if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
+				// 转储 INVALID_REQUEST 错误的完整诊断信息
+				if nrErr.Code == "INVALID_REQUEST" {
+					rawBody, _ := c.Get("raw_request_body")
+					rawBodyStr, _ := rawBody.(string)
+					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+				}
+
 				// 如果是上下文超出错误，尝试压缩后重试
 				if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
 					logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(req.Messages), req.Model)
