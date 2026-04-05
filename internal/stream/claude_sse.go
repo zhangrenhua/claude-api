@@ -39,56 +39,54 @@ var (
 	modelIDPattern = regexp.MustCompile(`claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
 )
 
-// replaceKiroInContent 在累计内容的前200个字符范围内，做品牌名和模型名替换
-// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上一次未输出的尾部缓冲
-// requestModel 是用户请求的模型名，用于模型名替换
+// replaceKiroInContent 在前200个字符范围内，用滑动窗口做品牌名和模型名替换
+// 滑动窗口（windowSize=50）解决 "Kiro"、"Claude 3.5 Sonnet" 等跨 chunk 断裂问题
+// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的窗口尾部
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
-// pending 用于处理 "Kiro" 跨 chunk 边界的情况（如 chunk1="...Ki", chunk2="ro..."）
 func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
 	const replaceLimit = 200
+	const windowSize = 50
 
-	// 已超过限制字符数，不再需要替换，flush pending 并直接返回
+	// 已超过上限，不再替换，flush pending 并直接透传
 	if charsSoFar >= replaceLimit {
-		return pending + content, charsSoFar + len(pending) + len(content), ""
+		if pending != "" {
+			content = pending + content
+			pending = ""
+		}
+		return content, charsSoFar + len(content), ""
 	}
 
-	// 将 pending 和新 content 合并处理
-	combined := pending + content
+	// 合并 pending 和新 chunk
+	buffer := pending + content
 
-	// 计算前 replaceLimit 字符范围内需要处理的长度
+	// 只对前 replaceLimit 范围内的部分做替换
 	remaining := replaceLimit - charsSoFar
 	var toProcess, passThrough string
-	if remaining >= len(combined) {
-		toProcess = combined
+	if remaining >= len(buffer) {
+		toProcess = buffer
 		passThrough = ""
 	} else {
-		toProcess = combined[:remaining]
-		passThrough = combined[remaining:]
+		toProcess = buffer[:remaining]
+		passThrough = buffer[remaining:]
 	}
 
-	// 在范围内做替换
+	// 替换
 	replaced := ReplaceBranding(toProcess)
 
-	// 如果还在范围内，检查尾部是否有 "Kiro" 的部分前缀需要缓冲
-	newCharsSoFar := charsSoFar
-	newPending := ""
+	// 如果还在范围内且无 passThrough，保留尾部窗口作为 pending
 	if passThrough == "" {
-		// 整段都在范围内，检查尾部是否可能是 "Kiro" 的前缀
-		for i := min(3, len(replaced)); i > 0; i-- {
-			suffix := replaced[len(replaced)-i:]
-			if strings.HasPrefix("Kiro", suffix) {
-				newPending = suffix
-				replaced = replaced[:len(replaced)-i]
-				break
-			}
+		if len(replaced) > windowSize {
+			newPending := replaced[len(replaced)-windowSize:]
+			emit := replaced[:len(replaced)-windowSize]
+			return emit, charsSoFar + len(emit), newPending
 		}
-		newCharsSoFar += len(replaced)
-		return replaced, newCharsSoFar, newPending
+		// 整段不足窗口大小，全部保留等下一个 chunk
+		return "", charsSoFar, replaced
 	}
 
-	// 跨越边界，不需要再缓冲
-	newCharsSoFar += len(replaced) + len(passThrough)
-	return replaced + passThrough, newCharsSoFar, ""
+	// 跨越上限边界：对 toProcess 部分做了替换，passThrough 部分直接透传
+	// 不再需要 pending
+	return replaced + passThrough, charsSoFar + len(replaced) + len(passThrough), ""
 }
 
 // SSE 事件格式化
