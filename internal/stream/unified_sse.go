@@ -84,9 +84,9 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 		}
 
 	case "assistantResponseEnd":
-		// flush 残留的 Kiro 替换缓冲
+		// flush 残留的 Kiro 替换缓冲（需要再做一次替换，因为 pending 可能包含完整但未替换的模式）
 		if h.pendingKiroBuffer != "" {
-			h.thinkingBuffer += h.pendingKiroBuffer
+			h.thinkingBuffer += ReplaceBranding(h.pendingKiroBuffer)
 			h.pendingKiroBuffer = ""
 			events = append(events, h.flushThinkingBuffer()...)
 		}

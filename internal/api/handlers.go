@@ -2710,12 +2710,13 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 前200个字符内做品牌名和模型名替换
+	// 前250个字符内做品牌名和模型名替换（多取50字符余量，避免从模式中间截断）
 	if len(fullContent) > 0 {
-		if len(fullContent) <= 200 {
+		const brandLimit = 250
+		if len(fullContent) <= brandLimit {
 			fullContent = stream.ReplaceBranding(fullContent)
 		} else {
-			fullContent = stream.ReplaceBranding(fullContent[:200]) + fullContent[200:]
+			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
 		}
 	}
 
@@ -3136,12 +3137,13 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 前200个字符内做品牌名和模型名替换
+	// 前250个字符内做品牌名和模型名替换（多取50字符余量，避免从模式中间截断）
 	if len(fullContent) > 0 {
-		if len(fullContent) <= 200 {
+		const brandLimit = 250
+		if len(fullContent) <= brandLimit {
 			fullContent = stream.ReplaceBranding(fullContent)
 		} else {
-			fullContent = stream.ReplaceBranding(fullContent[:200]) + fullContent[200:]
+			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
 		}
 	}
 
