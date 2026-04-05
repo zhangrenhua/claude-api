@@ -116,9 +116,23 @@ func calcBrandPendingLen(text string) int {
 		}
 		if ch == 'c' {
 			candidate := lower[pos:]
-			// "c","cl","cla","clau","claud" 是 "claude" 的不完整前缀
-			// "claude..." 开头的可能是 "claude sonnet"、"claude-3-5-..." 等完整模式
-			if strings.HasPrefix("claude", candidate) || strings.HasPrefix(candidate, "claude") {
+			if strings.HasPrefix("claude", candidate) {
+				// "c","cl","cla","clau","claud" — 不完整的 "claude" 前缀，需要缓冲
+				return i
+			}
+			if strings.HasPrefix(candidate, "claude") && len(candidate) > 6 {
+				// "claude" 后面还有字符，检查是否可能继续延伸为模式
+				nextCh := candidate[6]
+				if nextCh == ' ' || nextCh == '-' {
+					// 空格: 可能是 "claude sonnet"、"claude 3.5 sonnet" 等
+					// 短横线: 可能是 "claude-3-5-sonnet-20241022" 等
+					return i
+				}
+				// 其他字符（如 "claude!" "claude,"）不可能是模式，跳过
+				continue
+			}
+			if candidate == "claude" {
+				// 恰好以 "claude" 结尾，可能后续还有 " sonnet" 等
 				return i
 			}
 		}
