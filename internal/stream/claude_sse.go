@@ -14,29 +14,30 @@ const (
 	ThinkingEndTag   = "</thinking>"
 )
 
-// ReplaceBranding 对文本做品牌名和模型名替换
+// ReplaceBranding 对文本做品牌名和模型名替换（忽略大小写）
 // 1. Kiro → Claude
-// 2. 上游可能返回的旧模型名（如 "Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)"）→ "Claude Opus"
+// 2. 上游可能返回的模型名（如 "Claude Sonnet"、"Claude 3.5 Sonnet"、"claude-3-5-sonnet-20241022"）→ "Claude Opus"
 func ReplaceBranding(text string) string {
-	// Kiro → Claude
-	text = strings.Replace(text, "Kiro", "Claude", -1)
-
-	// 模型名替换：将上游返回的旧模型自称统一替换为 "Claude Opus"
 	const brandName = "Claude Opus"
+	// Kiro → Claude（忽略大小写）
+	text = kiroPattern.ReplaceAllString(text, "Claude")
+	// 模型名替换：统一替换为 "Claude Opus"，顺序：长匹配优先
 	text = modelWithParenPattern.ReplaceAllString(text, brandName)
 	text = modelFriendlyPattern.ReplaceAllString(text, brandName)
 	text = modelIDPattern.ReplaceAllString(text, brandName)
 	return text
 }
 
-// 模型名正则（预编译，避免每次调用重新编译）
+// 品牌名和模型名正则（预编译，忽略大小写）
 var (
+	// Kiro（忽略大小写）
+	kiroPattern = regexp.MustCompile(`(?i)kiro`)
 	// 匹配带括号的完整格式：Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)
-	modelWithParenPattern = regexp.MustCompile(`Claude\s+[\d.]+\s+\w+\s*\(claude-[\w.-]+\)`)
-	// 匹配友好名格式：Claude 3.5 Sonnet、Claude 4 Opus 等
-	modelFriendlyPattern = regexp.MustCompile(`Claude\s+[\d.]+\s+(?:Sonnet|Opus|Haiku)`)
+	modelWithParenPattern = regexp.MustCompile(`(?i)claude\s+[\d.]+\s+\w+\s*\(claude-[\w.-]+\)`)
+	// 匹配友好名格式：Claude Sonnet、Claude 3.5 Sonnet、claude haiku 等（版本号可选）
+	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:[\d.]+\s+)?(?:sonnet|opus|haiku)`)
 	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-4-opus-20250514 等
-	modelIDPattern = regexp.MustCompile(`claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
+	modelIDPattern = regexp.MustCompile(`(?i)claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
 )
 
 // replaceKiroInContent 在前200个字符范围内，用滑动窗口做品牌名和模型名替换

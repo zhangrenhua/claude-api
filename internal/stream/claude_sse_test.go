@@ -163,15 +163,15 @@ func TestHandleEvent_CompleteFlow(t *testing.T) {
 		t.Error("initial-response 应发送 message_start 事件")
 	}
 
-	// 2. assistantResponseEvent
+	// 2. assistantResponseEvent（内容需超过滑动窗口大小50字符才会立即输出）
 	events = handler.HandleEvent("assistantResponseEvent", map[string]interface{}{
-		"content": "Hello, world!",
+		"content": "Hello, world! This is a test response with enough content to exceed the sliding window buffer size.",
 	})
 	if len(events) == 0 {
 		t.Error("assistantResponseEvent 应返回事件")
 	}
 
-	// 3. assistantResponseEnd
+	// 3. assistantResponseEnd（会 flush 滑动窗口中的 pending 内容）
 	events = handler.HandleEvent("assistantResponseEnd", map[string]interface{}{})
 	if !handler.ResponseEnded {
 		t.Error("assistantResponseEnd 后 ResponseEnded 应为 true")
