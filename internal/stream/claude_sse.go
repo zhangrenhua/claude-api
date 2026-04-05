@@ -40,13 +40,12 @@ var (
 	modelIDPattern = regexp.MustCompile(`(?i)claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
 )
 
-// replaceKiroInContent 在前200个字符范围内，用滑动窗口做品牌名和模型名替换
-// 滑动窗口（windowSize=50）解决 "Kiro"、"Claude 3.5 Sonnet" 等跨 chunk 断裂问题
-// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的窗口尾部
+// replaceKiroInContent 在前200个字符范围内做品牌名和模型名替换
+// 智能检测尾部是否可能是品牌模式前缀，仅在必要时缓冲（而非固定窗口）
+// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的尾部
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
 func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
 	const replaceLimit = 200
-	const windowSize = 50
 
 	// 已超过上限，不再替换，flush pending 并直接透传
 	if charsSoFar >= replaceLimit {
@@ -74,20 +73,57 @@ func replaceKiroInContent(content string, charsSoFar int, pending string) (strin
 	// 替换
 	replaced := ReplaceBranding(toProcess)
 
-	// 如果还在范围内且无 passThrough，保留尾部窗口作为 pending
 	if passThrough == "" {
-		if len(replaced) > windowSize {
-			newPending := replaced[len(replaced)-windowSize:]
-			emit := replaced[:len(replaced)-windowSize]
-			return emit, charsSoFar + len(emit), newPending
+		// 还在范围内：智能检测尾部是否需要缓冲
+		pendingLen := calcBrandPendingLen(replaced)
+		if pendingLen > 0 && pendingLen < len(replaced) {
+			emit := replaced[:len(replaced)-pendingLen]
+			return emit, charsSoFar + len(emit), replaced[len(replaced)-pendingLen:]
 		}
-		// 整段不足窗口大小，全部保留等下一个 chunk
-		return "", charsSoFar, replaced
+		if pendingLen >= len(replaced) {
+			// 整段都是潜在模式前缀，缓冲等下一个 chunk
+			return "", charsSoFar, replaced
+		}
+		// 尾部无模式前缀，全部输出
+		return replaced, charsSoFar + len(replaced), ""
 	}
 
 	// 跨越上限边界：对 toProcess 部分做了替换，passThrough 部分直接透传
-	// 不再需要 pending
 	return replaced + passThrough, charsSoFar + len(replaced) + len(passThrough), ""
+}
+
+// calcBrandPendingLen 从尾部扫描，判断有多少字符可能是品牌模式的前缀
+// 所有品牌模式都以 "claude"（忽略大小写）或 "kiro" 开头
+// 只在尾部发现这些前缀时才需要缓冲，否则返回 0（立即输出）
+func calcBrandPendingLen(text string) int {
+	if len(text) == 0 {
+		return 0
+	}
+	lower := strings.ToLower(text)
+	maxScan := len(lower)
+	if maxScan > 50 {
+		maxScan = 50
+	}
+
+	for i := 1; i <= maxScan; i++ {
+		pos := len(lower) - i
+		ch := lower[pos]
+		if ch == 'k' {
+			candidate := lower[pos:]
+			if strings.HasPrefix("kiro", candidate) {
+				return i
+			}
+		}
+		if ch == 'c' {
+			candidate := lower[pos:]
+			// "c","cl","cla","clau","claud" 是 "claude" 的不完整前缀
+			// "claude..." 开头的可能是 "claude sonnet"、"claude-3-5-..." 等完整模式
+			if strings.HasPrefix("claude", candidate) || strings.HasPrefix(candidate, "claude") {
+				return i
+			}
+		}
+	}
+	return 0
 }
 
 // SSE 事件格式化
