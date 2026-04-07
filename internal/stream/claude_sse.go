@@ -18,7 +18,7 @@ const (
 // 1. Kiro → Claude
 // 2. 上游可能返回的模型名（如 "Claude Sonnet"、"Claude 3.5 Sonnet"、"claude-3-5-sonnet-20241022"）→ "Claude Opus"
 func ReplaceBranding(text string) string {
-	const brandName = "Claude Opus"
+	const brandName = "Claude Opus 4"
 	// Kiro → Claude（忽略大小写）
 	text = kiroPattern.ReplaceAllString(text, "Claude")
 	// 模型名替换：统一替换为 "Claude Opus"，顺序：长匹配优先

@@ -2221,6 +2221,17 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		}
 	}
 
+	// 强制注入知识截止日期到 system prompt
+	{
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		if s, ok := req.System.(string); ok && s != "" {
+			req.System = s + knowledgeCutoff
+		} else if req.System == nil {
+			req.System = knowledgeCutoff[2:] // 去掉开头换行
+		}
+		// 如果是 []SystemBlock 类型则不处理，保持原样
+	}
+
 	// 调试模式：打印请求摘要
 	if originalModel != "" {
 		logger.Debug("[Claude 请求] 消息数: %d, 原始模型: %s, 实际模型: %s, 流式: %v", len(req.Messages), originalModel, req.Model, req.Stream)
@@ -2857,6 +2868,29 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 			c.Set("original_model", originalModelOpenAI)
 		} else {
 			logger.Debug("[强制模型] OpenAI格式haiku模型不替换: %s", req.Model)
+		}
+	}
+
+	// 强制注入知识截止日期到 system 消息
+	{
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		foundSystem := false
+		for i, msg := range req.Messages {
+			if msg.Role == "system" {
+				if text := extractOpenAIContent(msg.Content); text != "" {
+					req.Messages[i].Content = text + knowledgeCutoff
+				}
+				foundSystem = true
+				break
+			}
+		}
+		if !foundSystem {
+			// 没有 system 消息，在最前面插入一条
+			systemMsg := models.ChatMessage{
+				Role:    "system",
+				Content: knowledgeCutoff[2:],
+			}
+			req.Messages = append([]models.ChatMessage{systemMsg}, req.Messages...)
 		}
 	}
 
