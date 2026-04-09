@@ -155,9 +155,18 @@ func (ssm *SSEStateManager) handleContentBlockStart(eventData map[string]interfa
 		}
 	}
 
-	// 关键修复：为 thinking 块添加 signature 字段（Claude 标准要求）
-	if blockType == "thinking" {
-		if contentBlock, ok := eventData["content_block"].(map[string]interface{}); ok {
+	// 关键修复：为 content_block 补全必要字段（Claude 标准要求）
+	if contentBlock, ok := eventData["content_block"].(map[string]interface{}); ok {
+		switch blockType {
+		case "text":
+			if _, hasText := contentBlock["text"]; !hasText {
+				contentBlock["text"] = ""
+				logger.Debug("为 text 块添加缺失的 text 字段 - index: %d", index)
+			}
+		case "thinking":
+			if _, hasThinking := contentBlock["thinking"]; !hasThinking {
+				contentBlock["thinking"] = ""
+			}
 			if _, hasSignature := contentBlock["signature"]; !hasSignature {
 				contentBlock["signature"] = ""
 				logger.Debug("为 thinking 块添加缺失的 signature 字段 - index: %d", index)
