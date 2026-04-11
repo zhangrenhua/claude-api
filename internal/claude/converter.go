@@ -326,25 +326,8 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 			desc = desc[:10000]
 			logger.Debug("[消息转换] 工具描述超长已截断: %s", t.Name)
 		}
-		// 清理 inputSchema 中 Amazon Q 不接受的字段
-		inputSchema := t.InputSchema
-		for key, val := range inputSchema {
-			if val == nil {
-				// 值为 null（如 "required": null）
-				delete(inputSchema, key)
-				continue
-			}
-			// 空数组（如 "required": []）
-			if arr, ok := val.([]interface{}); ok && len(arr) == 0 {
-				delete(inputSchema, key)
-				continue
-			}
-			// 空对象（如 "properties": {}）
-			if obj, ok := val.(map[string]interface{}); ok && len(obj) == 0 {
-				delete(inputSchema, key)
-				continue
-			}
-		}
+		// 递归清理 inputSchema 中 Amazon Q 不接受的字段
+		inputSchema := sanitizeJSONSchema(t.InputSchema)
 
 		aqTools = append(aqTools, models.Tool{
 			ToolSpecification: models.ToolSpecification{
@@ -454,17 +437,21 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 	if req.System != nil {
 		sysText := extractSystemText(req.System)
 		if sysText != "" {
-			// 与参考项目一致：system prompt 转换为 user-assistant 消息对
+			// system prompt 转换为 user-assistant 消息对
 			systemHistory = append(systemHistory, models.HistoryMessage{
-				MessageID: "msg-001",
 				UserInputMessage: &models.UserInputMessage{
 					Content: sysText,
+					UserInputMessageContext: models.UserInputMessageContext{
+						EnvState: models.EnvState{
+							OperatingSystem:         getOperatingSystem(),
+							CurrentWorkingDirectory: "/",
+						},
+					},
 					Origin:  "AI_EDITOR",
 					ModelID: modelID,
 				},
 			})
 			systemHistory = append(systemHistory, models.HistoryMessage{
-				MessageID: "msg-002",
 				AssistantResponseMessage: &models.AssistantResponseMessage{
 					Content: "OK",
 				},
@@ -472,8 +459,8 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		}
 	}
 
-	// 处理常规历史消息（从 msg-003 开始编号）
-	aqHistory := processClaudeHistoryWithMessageID(historyMsgs, thinkingEnabled, modelID, len(systemHistory)+1)
+	// 处理常规历史消息
+	aqHistory := processClaudeHistoryWithMessageID(historyMsgs, thinkingEnabled, modelID)
 
 	// 合并 system 历史和常规历史
 	fullHistory := append(systemHistory, aqHistory...)
@@ -600,6 +587,75 @@ func mergeToolResultIntoMap(resultsByID map[string]*models.ToolResult, order *[]
 		resultsByID[tr.ToolUseID] = &trCopy
 		*order = append(*order, tr.ToolUseID)
 	}
+}
+
+// sanitizeJSONSchema 递归清理 JSON Schema 中 Amazon Q 不接受的字段
+// 与 kiro-gateway 的 sanitize_json_schema 保持一致：
+// - 移除所有层级的 additionalProperties（Amazon Q 不支持）
+// - 移除空的 required 数组
+// - 移除值为 null 的字段
+// - 递归处理 properties、anyOf、oneOf 等嵌套结构
+func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
+	if len(schema) == 0 {
+		return schema
+	}
+
+	result := make(map[string]interface{}, len(schema))
+	for key, val := range schema {
+		// 移除 null 值
+		if val == nil {
+			continue
+		}
+		// 移除 additionalProperties（Amazon Q 不支持）
+		if key == "additionalProperties" {
+			continue
+		}
+		// 移除空的 required 数组
+		if key == "required" {
+			if arr, ok := val.([]interface{}); ok && len(arr) == 0 {
+				continue
+			}
+		}
+
+		// 递归处理 properties 内的每个属性 schema
+		if key == "properties" {
+			if propsMap, ok := val.(map[string]interface{}); ok {
+				cleanedProps := make(map[string]interface{}, len(propsMap))
+				for propName, propVal := range propsMap {
+					if propSchema, ok := propVal.(map[string]interface{}); ok {
+						cleanedProps[propName] = sanitizeJSONSchema(propSchema)
+					} else {
+						cleanedProps[propName] = propVal
+					}
+				}
+				result[key] = cleanedProps
+				continue
+			}
+		}
+
+		// 递归处理嵌套对象（如 items 等）
+		if nested, ok := val.(map[string]interface{}); ok {
+			result[key] = sanitizeJSONSchema(nested)
+			continue
+		}
+
+		// 递归处理数组元素（如 anyOf、oneOf）
+		if arr, ok := val.([]interface{}); ok {
+			cleanedArr := make([]interface{}, 0, len(arr))
+			for _, item := range arr {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					cleanedArr = append(cleanedArr, sanitizeJSONSchema(itemMap))
+				} else {
+					cleanedArr = append(cleanedArr, item)
+				}
+			}
+			result[key] = cleanedArr
+			continue
+		}
+
+		result[key] = val
+	}
+	return result
 }
 
 // extractClaudeTextContent 从 Claude 内容中提取文本（包括 thinking 内容）
@@ -799,9 +855,8 @@ func extractClaudeToolResults(content interface{}) []models.ToolResult {
 }
 
 // processClaudeHistoryWithMessageID 处理 Claude 历史消息，转换为 Amazon Q 格式
-func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinkingEnabled bool, modelID string, startMsgID int) []models.HistoryMessage {
+func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinkingEnabled bool, modelID string) []models.HistoryMessage {
 	var history []models.HistoryMessage
-	msgCounter := startMsgID
 	seenToolUseIDs := make(map[string]bool)
 	var lastToolUseOrder []string
 	var lastMsgType string // "user", "assistant"
@@ -812,12 +867,10 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 			// 检测连续 user 消息，插入 "OK" 的 assistant
 			if lastMsgType == "user" {
 				history = append(history, models.HistoryMessage{
-					MessageID: fmt.Sprintf("msg-%03d", msgCounter),
 					AssistantResponseMessage: &models.AssistantResponseMessage{
 						Content: "OK",
 					},
 				})
-				msgCounter++
 			}
 
 			textContent := extractClaudeTextContent(msg.Content)
@@ -852,7 +905,6 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 			}
 
 			history = append(history, models.HistoryMessage{
-				MessageID: fmt.Sprintf("msg-%03d", msgCounter),
 				UserInputMessage: &models.UserInputMessage{
 					Content:                 textContent,
 					UserInputMessageContext: *userCtx,
@@ -861,7 +913,6 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 					Images:                  images,
 				},
 			})
-			msgCounter++
 			lastMsgType = "user"
 
 		} else if msg.Role == "assistant" {
@@ -875,7 +926,6 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 			// 检测连续 assistant 消息，插入 "Continue" 的 user
 			if lastMsgType == "assistant" {
 				history = append(history, models.HistoryMessage{
-					MessageID: fmt.Sprintf("msg-%03d", msgCounter),
 					UserInputMessage: &models.UserInputMessage{
 						Content: "Continue",
 						UserInputMessageContext: models.UserInputMessageContext{
@@ -888,16 +938,18 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 						ModelID: modelID,
 					},
 				})
-				msgCounter++
+			}
+
+			// assistant content 为空时兜底（仅有 tool_use 无文本的情况）
+			if textContent == "" {
+				textContent = "..."
 			}
 
 			entry := models.HistoryMessage{
-				MessageID: fmt.Sprintf("msg-%03d", msgCounter),
 				AssistantResponseMessage: &models.AssistantResponseMessage{
 					Content: textContent,
 				},
 			}
-			msgCounter++
 
 			// 追踪 tool_use 顺序
 			lastToolUseOrder = nil
@@ -938,13 +990,12 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 		}
 	}
 
-	// 确保历史以 assistant 消息结尾（与参考项目一致）
+	// 确保历史以 assistant 消息结尾
 	if len(history) > 0 {
 		lastItem := history[len(history)-1]
 		if lastItem.UserInputMessage != nil {
 			// 最后是 user 消息，补充一个 "OK" 的 assistant
 			history = append(history, models.HistoryMessage{
-				MessageID: fmt.Sprintf("msg-%03d", msgCounter),
 				AssistantResponseMessage: &models.AssistantResponseMessage{
 					Content: "OK",
 				},
@@ -1018,10 +1069,14 @@ func processClaudeHistory(messages []models.ClaudeMessage, thinkingEnabled bool)
 				continue
 			}
 
+			// assistant content 为空时兜底
+			if textContent == "" {
+				textContent = "..."
+			}
+
 			entry := models.HistoryMessage{
 				AssistantResponseMessage: &models.AssistantResponseMessage{
-					MessageID: uuid.New().String(),
-					Content:   textContent,
+					Content: textContent,
 				},
 			}
 
@@ -1169,8 +1224,7 @@ func ensureAlternatingMessages(history []models.HistoryMessage) []models.History
 			logger.Debug("[历史处理] 检测到连续 user 消息，插入空 assistant 占位消息")
 			result = append(result, models.HistoryMessage{
 				AssistantResponseMessage: &models.AssistantResponseMessage{
-					MessageID: uuid.New().String(),
-					Content:   "...",
+					Content: "...",
 				},
 			})
 		}

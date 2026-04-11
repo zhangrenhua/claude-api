@@ -70,10 +70,10 @@ func TestConvertClaudeToAmazonQ_WithHistory(t *testing.T) {
 		t.Error("历史消息不应为空")
 	}
 
-	// 验证历史消息有 messageId（与参考项目一致）
+	// 验证历史消息是 tagged union 格式（无顶层 messageId）
 	for i, msg := range result.ConversationState.History {
-		if msg.MessageID == "" {
-			t.Errorf("历史消息 %d 应有 messageId", i)
+		if msg.UserInputMessage == nil && msg.AssistantResponseMessage == nil {
+			t.Errorf("历史消息 %d 应有 userInputMessage 或 assistantResponseMessage", i)
 		}
 	}
 
@@ -176,6 +176,20 @@ func TestConvertClaudeToAmazonQ_WithToolResults(t *testing.T) {
 		Model:     "claude-sonnet-4-20250514",
 		MaxTokens: 1024,
 		Messages: []models.ClaudeMessage{
+			{Role: "user", Content: "Check the weather"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "tool_use",
+						"id":   "tool_123",
+						"name": "get_weather",
+						"input": map[string]interface{}{
+							"city": "Beijing",
+						},
+					},
+				},
+			},
 			{
 				Role: "user",
 				Content: []interface{}{
@@ -197,7 +211,7 @@ func TestConvertClaudeToAmazonQ_WithToolResults(t *testing.T) {
 	// 验证 toolResults 存在
 	toolResults := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults
 	if len(toolResults) != 1 {
-		t.Errorf("应有 1 个 toolResult, got: %d", len(toolResults))
+		t.Fatalf("应有 1 个 toolResult, got: %d", len(toolResults))
 	}
 
 	// 验证 tool_use_id
@@ -481,8 +495,8 @@ func TestConvertClaudeToAmazonQ_WithToolUseHistory(t *testing.T) {
 	}
 }
 
-// TestConvertClaudeToAmazonQ_HistoryMessageIdFormat 测试历史消息 messageId 格式
-func TestConvertClaudeToAmazonQ_HistoryMessageIdFormat(t *testing.T) {
+// TestConvertClaudeToAmazonQ_HistoryTaggedUnionFormat 测试历史消息为 tagged union 格式
+func TestConvertClaudeToAmazonQ_HistoryTaggedUnionFormat(t *testing.T) {
 	req := &models.ClaudeRequest{
 		Model:     "claude-sonnet-4-20250514",
 		MaxTokens: 1024,
@@ -501,13 +515,32 @@ func TestConvertClaudeToAmazonQ_HistoryMessageIdFormat(t *testing.T) {
 		t.Fatalf("转换失败: %v", err)
 	}
 
-	// 验证所有历史消息都有 messageId，且格式为 msg-XXX
+	// 验证所有历史消息是 tagged union 格式：只有 userInputMessage 或 assistantResponseMessage
 	for i, msg := range result.ConversationState.History {
-		if msg.MessageID == "" {
-			t.Errorf("历史消息 %d 应有 messageId", i)
+		hasUser := msg.UserInputMessage != nil
+		hasAssistant := msg.AssistantResponseMessage != nil
+		if !hasUser && !hasAssistant {
+			t.Errorf("历史消息 %d 应有 userInputMessage 或 assistantResponseMessage", i)
 		}
-		if !strings.HasPrefix(msg.MessageID, "msg-") {
-			t.Errorf("messageId 应以 'msg-' 开头, got: %s", msg.MessageID)
+		if hasUser && hasAssistant {
+			t.Errorf("历史消息 %d 不应同时有 userInputMessage 和 assistantResponseMessage", i)
+		}
+	}
+
+	// 验证 JSON 输出中无顶层 messageId
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("JSON 序列化失败: %v", err)
+	}
+	// 检查 history 中不包含 "messageId" 作为顶层字段
+	var raw map[string]interface{}
+	json.Unmarshal(jsonBytes, &raw)
+	cs := raw["conversationState"].(map[string]interface{})
+	history := cs["history"].([]interface{})
+	for i, entry := range history {
+		entryMap := entry.(map[string]interface{})
+		if _, hasMessageID := entryMap["messageId"]; hasMessageID {
+			t.Errorf("历史消息 %d 不应有顶层 messageId 字段", i)
 		}
 	}
 }

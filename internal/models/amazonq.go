@@ -78,39 +78,30 @@ func (c ConversationState) MarshalJSON() ([]byte, error) {
 }
 
 // HistoryMessage 表示对话历史中的消息
+// 上游 API 是 tagged union：只能是 userInputMessage 或 assistantResponseMessage 之一，
+// 不应有顶层 messageId 兄弟字段（messageId 仅存在于 assistantResponseMessage 内部）
 type HistoryMessage struct {
-	MessageID                string                    `json:"messageId,omitempty"`
 	UserInputMessage         *UserInputMessage         `json:"userInputMessage,omitempty"`
 	AssistantResponseMessage *AssistantResponseMessage `json:"assistantResponseMessage,omitempty"`
 }
 
-// MarshalJSON 自定义序列化，=
+// MarshalJSON 自定义序列化，tagged union 格式（二选一）
 func (h HistoryMessage) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteString(`{`)
-	first := true
-
-	// 输出 messageId（如果存在）
-	if h.MessageID != "" {
-		buf.WriteString(`"messageId":`)
-		mid, _ := json.Marshal(h.MessageID)
-		buf.Write(mid)
-		first = false
-	}
+	written := false
 
 	if h.UserInputMessage != nil {
-		if !first {
-			buf.WriteString(`,`)
-		}
 		buf.WriteString(`"userInputMessage":`)
 		um, err := json.Marshal(h.UserInputMessage)
 		if err != nil {
 			return nil, err
 		}
 		buf.Write(um)
+		written = true
 	}
 	if h.AssistantResponseMessage != nil {
-		if !first {
+		if written {
 			buf.WriteString(`,`)
 		}
 		buf.WriteString(`"assistantResponseMessage":`)
@@ -204,19 +195,14 @@ func (u UserInputMessageContext) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteString(`{`)
 
-	// 检查是否有任何内容
-	hasContent := false
-
-	// envState - 只有当有 tools 时才输出
-	if len(u.Tools) > 0 {
-		buf.WriteString(`"envState":`)
-		env, err := json.Marshal(u.EnvState)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(env)
-		hasContent = true
+	// envState - 始终输出，Amazon Q 要求此字段存在
+	buf.WriteString(`"envState":`)
+	env, err := json.Marshal(u.EnvState)
+	if err != nil {
+		return nil, err
 	}
+	buf.Write(env)
+	hasContent := true
 
 	// tools
 	if len(u.Tools) > 0 {
@@ -564,22 +550,24 @@ type ToolResultContent struct {
 }
 
 // AssistantResponseMessage 表示助手的响应
-// 字段顺序: messageId -> content -> toolUses
+// 字段顺序: content -> messageId(可选) -> toolUses(可选)
 type AssistantResponseMessage struct {
 	MessageID string    `json:"messageId"`
 	Content   string    `json:"content"`
 	ToolUses  []ToolUse `json:"toolUses,omitempty"`
 }
 
-// MarshalJSON 自定义序列化，确保字段顺序: messageId -> content -> toolUses
+// MarshalJSON 自定义序列化，确保字段顺序: content -> toolUses（messageId 仅在非空时输出）
 func (a AssistantResponseMessage) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteString(`{"messageId":`)
-	mid, _ := json.Marshal(a.MessageID)
-	buf.Write(mid)
-	buf.WriteString(`,"content":`)
+	buf.WriteString(`{"content":`)
 	c, _ := json.Marshal(a.Content)
 	buf.Write(c)
+	if a.MessageID != "" {
+		buf.WriteString(`,"messageId":`)
+		mid, _ := json.Marshal(a.MessageID)
+		buf.Write(mid)
+	}
 	if len(a.ToolUses) > 0 {
 		buf.WriteString(`,"toolUses":`)
 		tu, err := json.Marshal(a.ToolUses)

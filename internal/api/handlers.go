@@ -2099,11 +2099,17 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		originalToolCount := len(req.Tools)
 		var filteredTools []models.ClaudeTool
 
-		// 1. 剔除内置工具（web_search, code_execution 等，无 input_schema）
+		// 1. 剔除内置工具（web_search, code_execution 等，无 input_schema），并清理 schema 中的非法值
 		for _, t := range req.Tools {
 			if t.InputSchema == nil {
 				logger.Info("[工具预处理] 剔除内置工具（上游不支持）: %s", t.Name)
 				continue
+			}
+			// 清理 input_schema 中 Claude API 不接受的字段值（如 "required": null）
+			for key, val := range t.InputSchema {
+				if val == nil {
+					delete(t.InputSchema, key)
+				}
 			}
 			filteredTools = append(filteredTools, t)
 		}
@@ -2179,20 +2185,37 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			}
 		}
 
-		// 4. 如果 tool_choice 指向已被剔除的工具，清除 tool_choice
-		if req.ToolChoice != nil && len(filteredTools) < originalToolCount {
+		// 4. 修正 tool_choice 格式并清理无效引用
+		if req.ToolChoice != nil {
 			if tc, ok := req.ToolChoice.(map[string]interface{}); ok {
-				if toolName, exists := tc["name"].(string); exists {
-					found := false
-					for _, t := range filteredTools {
-						if t.Name == toolName {
-							found = true
-							break
+				// 将 OpenAI 格式 {"type":"function","function":{"name":"xxx"}} 转为 Claude 格式 {"type":"tool","name":"xxx"}
+				if tc["type"] == "function" {
+					if fn, ok := tc["function"].(map[string]interface{}); ok {
+						if name, ok := fn["name"].(string); ok {
+							req.ToolChoice = map[string]interface{}{
+								"type": "tool",
+								"name": name,
+							}
+							tc = req.ToolChoice.(map[string]interface{})
+							logger.Debug("[工具预处理] tool_choice 从 OpenAI function 格式转为 Claude tool 格式: %s", name)
 						}
 					}
-					if !found {
-						logger.Info("[工具预处理] tool_choice 指向已剔除的工具 %s，清除 tool_choice", toolName)
-						req.ToolChoice = nil
+				}
+
+				// 如果 tool_choice 指向已被剔除的工具，清除 tool_choice
+				if len(filteredTools) < originalToolCount {
+					if toolName, exists := tc["name"].(string); exists {
+						found := false
+						for _, t := range filteredTools {
+							if t.Name == toolName {
+								found = true
+								break
+							}
+						}
+						if !found {
+							logger.Info("[工具预处理] tool_choice 指向已剔除的工具 %s，清除 tool_choice", toolName)
+							req.ToolChoice = nil
+						}
 					}
 				}
 			}
