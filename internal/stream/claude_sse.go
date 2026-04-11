@@ -34,10 +34,13 @@ var (
 	kiroPattern = regexp.MustCompile(`(?i)kiro`)
 	// 匹配带括号的完整格式：Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)
 	modelWithParenPattern = regexp.MustCompile(`(?i)claude\s+[\d.]+\s+\w+\s*\(claude-[\w.-]+\)`)
-	// 匹配友好名格式：Claude Sonnet、Claude 3.5 Sonnet、claude haiku 等（版本号可选）
-	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:[\d.]+\s+)?(?:sonnet|opus|haiku)`)
-	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-4-opus-20250514 等
-	modelIDPattern = regexp.MustCompile(`(?i)claude-[\d]+-[\d.]+-(?:sonnet|opus|haiku)-\d{8}`)
+	// 匹配友好名格式：Claude Sonnet、Claude 3.5 Sonnet、Claude Opus 4 等
+	// 尾部可选版本号 (?:\s+[\d.]+)? 确保：
+	//   1. "Claude Sonnet 4.5" 整体匹配（不留下多余的 " 4.5"）
+	//   2. "Claude Opus 4" 替换为自身（幂等，不会叠加出 "4 4 4"）
+	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:[\d.]+\s+)?(?:sonnet|opus|haiku)(?:\s+[\d.]+)?`)
+	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-sonnet-4-5-20250929 等
+	modelIDPattern = regexp.MustCompile(`(?i)claude-(?:[\d.]+-)*(?:sonnet|opus|haiku)(?:-[\w.]+)*`)
 )
 
 // replaceKiroInContent 在前200个字符范围内做品牌名和模型名替换
@@ -516,9 +519,9 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 		}
 
 	case "assistantResponseEnd":
-		// flush 残留的 Kiro 替换缓冲（需要再做一次替换，因为 pending 可能包含完整但未替换的模式）
+		// flush 残留的 Kiro 替换缓冲（pending 已经过 ReplaceBranding 处理，直接输出）
 		if h.PendingKiroBuffer != "" {
-			h.ThinkBuffer += ReplaceBranding(h.PendingKiroBuffer)
+			h.ThinkBuffer += h.PendingKiroBuffer
 			h.PendingKiroBuffer = ""
 			flushEvents := h.processThinkBuffer()
 			events = append(events, flushEvents...)
