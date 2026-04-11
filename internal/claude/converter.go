@@ -610,6 +610,10 @@ func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
 		if key == "additionalProperties" {
 			continue
 		}
+		// 移除 $schema 元属性（Amazon Q 工具 schema 不接受 JSON Schema 元数据）
+		if key == "$schema" {
+			continue
+		}
 		// 移除空的 required 数组
 		if key == "required" {
 			if arr, ok := val.([]interface{}); ok && len(arr) == 0 {
