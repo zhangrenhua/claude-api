@@ -4,8 +4,8 @@
 # 用法: 修改 BASE_URL 和 API_KEY 后执行
 # ============================================================
 
-BASE_URL="http://35.225.136.9:62311"
-API_KEY="sk-9KMkQjNEJm1uWf9QdEeUVN4RKj4D7cwtdlJZt9UcbFO"
+BASE_URL="https://ccvibe.cc"
+API_KEY="sk-17427412f279e57994d829c139655a5b61f66a57038bbfebeff96a8a3542dd58"
 
 # 通用 header
 H_AUTH="x-api-key: ${API_KEY}"
