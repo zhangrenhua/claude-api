@@ -260,6 +260,98 @@ func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessag
 	return result
 }
 
+// flattenToolReferencesForNoToolsRequest 当请求没有定义任何工具时，
+// 将历史和当前消息中的结构化 toolUses/toolResults 转换为纯文本。
+// 场景：客户端（如 Zed 编辑器的标题生成）发送请求时不携带工具定义，
+// 但对话历史中包含工具调用，上游会因"引用未定义的工具"返回 ValidationException。
+// 返回是否做了任何修改。
+func flattenToolReferencesForNoToolsRequest(history []models.HistoryMessage, currentMsg *models.UserInputMessage) bool {
+	modified := false
+
+	for i := range history {
+		// 将 assistant 消息中的 toolUses 转换为文本描述
+		if am := history[i].AssistantResponseMessage; am != nil && len(am.ToolUses) > 0 {
+			var names []string
+			for _, tu := range am.ToolUses {
+				names = append(names, tu.Name)
+			}
+			toolText := "[Called: " + strings.Join(names, ", ") + "]"
+			if am.Content == "..." || am.Content == "" {
+				am.Content = toolText
+			} else {
+				am.Content += "\n" + toolText
+			}
+			am.ToolUses = nil
+			modified = true
+		}
+
+		// 移除 user 消息中的 toolResults（文本内容已包含足够上下文）
+		if um := history[i].UserInputMessage; um != nil && len(um.UserInputMessageContext.ToolResults) > 0 {
+			um.UserInputMessageContext.ToolResults = nil
+			modified = true
+		}
+	}
+
+	// 移除当前消息中的 toolResults
+	if currentMsg != nil && len(currentMsg.UserInputMessageContext.ToolResults) > 0 {
+		currentMsg.UserInputMessageContext.ToolResults = nil
+		modified = true
+	}
+
+	return modified
+}
+
+// fixDanglingToolUses 修复 history 尾部 assistant 发起了 tool_use 但 currentMessage 缺少配对 tool_result 的情况。
+// 当用户跳过工具执行直接发送文本消息时会出现此情况。
+// 上游要求每个 tool_use 都有配对的 tool_result，否则返回 ValidationException。
+// 修复方式：将缺少配对的 toolResult 注入到 currentMessage 的 context 中。
+func fixDanglingToolUses(history []models.HistoryMessage, currentMsg *models.UserInputMessage) {
+	if len(history) == 0 || currentMsg == nil {
+		return
+	}
+
+	// 找到 history 最后一条 assistant 消息
+	var lastAssistant *models.AssistantResponseMessage
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].AssistantResponseMessage != nil {
+			lastAssistant = history[i].AssistantResponseMessage
+			break
+		}
+	}
+	if lastAssistant == nil || len(lastAssistant.ToolUses) == 0 {
+		return
+	}
+
+	// 收集 currentMessage 中已有的 toolResult IDs
+	existingResults := make(map[string]bool)
+	for _, tr := range currentMsg.UserInputMessageContext.ToolResults {
+		existingResults[tr.ToolUseID] = true
+	}
+
+	// 为缺少配对的 tool_use 注入合成 toolResult
+	var injected int
+	for _, tu := range lastAssistant.ToolUses {
+		if existingResults[tu.ToolUseID] {
+			continue
+		}
+		currentMsg.UserInputMessageContext.ToolResults = append(
+			currentMsg.UserInputMessageContext.ToolResults,
+			models.ToolResult{
+				ToolUseID: tu.ToolUseID,
+				Content: []models.ToolResultContent{
+					{Text: "Tool execution was interrupted by the user."},
+				},
+				Status: "error",
+			},
+		)
+		injected++
+	}
+
+	if injected > 0 {
+		logger.Info("[消息转换] 注入 %d 个合成 toolResult 以修复悬空 tool_use", injected)
+	}
+}
+
 func extractSystemText(system interface{}) string {
 	switch s := system.(type) {
 	case string:
@@ -477,6 +569,19 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 			}
 		}
 	}
+
+	// 当请求没有定义任何工具时，将 toolUses/toolResults 平坦化为纯文本
+	// 避免上游因"引用了未定义的工具"返回 ValidationException ("Improperly formed request")
+	if len(aqTools) == 0 {
+		if flattenToolReferencesForNoToolsRequest(fullHistory, &userInputMsg) {
+			logger.Info("[消息转换] 请求无工具定义但包含工具引用，已平坦化为纯文本")
+		}
+	}
+
+	// 修复悬空 tool_use：history 尾部 assistant 发起了 tool_use，
+	// 但 currentMessage 没有提供对应的 tool_result（用户跳过了工具执行直接发文本）。
+	// 上游要求 tool_use 必须有配对的 tool_result，否则返回 "Improperly formed request"。
+	fixDanglingToolUses(fullHistory, &userInputMsg)
 
 	// 8. 构建最终负载
 	result := &models.AmazonQRequest{
