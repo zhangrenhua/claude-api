@@ -133,6 +133,26 @@ func (p *AccountPool) Refresh(ctx context.Context) {
 		return
 	}
 
+	// 按有效日期排序：有效日期较近的账号优先使用，无有效日期的排后面
+	sort.SliceStable(accounts, func(i, j int) bool {
+		iExpiry := accounts[i].TokenExpiry
+		jExpiry := accounts[j].TokenExpiry
+
+		iHas := iExpiry != nil && *iExpiry > 0
+		jHas := jExpiry != nil && *jExpiry > 0
+
+		if !iHas && !jHas {
+			return false
+		}
+		if !iHas {
+			return false
+		}
+		if !jHas {
+			return true
+		}
+		return *iExpiry < *jExpiry
+	})
+
 	p.mu.Lock()
 	p.accounts = accounts
 	p.lastRefresh = time.Now()
