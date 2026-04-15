@@ -171,7 +171,7 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         addr,
 		Handler:      server.Router(),
-		ReadTimeout:  15 * time.Second,
+		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 300 * time.Second, // 流式响应需要较长超时
 		IdleTimeout:  120 * time.Second,
 	}
