@@ -3762,13 +3762,15 @@ func convertResponsesInputToMessages(input interface{}, instructions string) ([]
 				if role == "developer" {
 					role = "system"
 				}
-				// 规范化 Responses API content 类型: input_text → text, input_image → image
+				// 规范化 Responses API content 类型: input_text/output_text → text, input_image → image
 				content := m["content"]
 				if contentArr, ok := content.([]interface{}); ok {
 					for i, part := range contentArr {
 						if partMap, ok := part.(map[string]interface{}); ok {
-							if partType, _ := partMap["type"].(string); strings.HasPrefix(partType, "input_") {
-								partMap["type"] = strings.TrimPrefix(partType, "input_")
+							if partType, _ := partMap["type"].(string); strings.HasPrefix(partType, "input_") || strings.HasPrefix(partType, "output_") {
+								partType = strings.TrimPrefix(partType, "input_")
+								partType = strings.TrimPrefix(partType, "output_")
+								partMap["type"] = partType
 								contentArr[i] = partMap
 							}
 						}

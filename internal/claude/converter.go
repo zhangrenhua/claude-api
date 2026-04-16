@@ -260,6 +260,59 @@ func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessag
 	return result
 }
 
+// mergeConsecutiveToolResults 合并连续的 tool_result user 消息
+// 某些客户端（如 Claude Code）会将同一轮的多个 tool_result 拆成独立的 user 消息，
+// 但 Amazon Q 要求 assistant toolUses 后的 user 消息必须包含所有对应的 toolResults。
+func mergeConsecutiveToolResults(messages []models.ClaudeMessage) []models.ClaudeMessage {
+	if len(messages) < 2 {
+		return messages
+	}
+
+	result := make([]models.ClaudeMessage, 0, len(messages))
+
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+
+		if msg.Role == "user" && isAllToolResults(msg.Content) {
+			blocks, _ := msg.Content.([]interface{})
+			merged := make([]interface{}, len(blocks))
+			copy(merged, blocks)
+
+			count := 1
+			for i+1 < len(messages) && messages[i+1].Role == "user" && isAllToolResults(messages[i+1].Content) {
+				i++
+				count++
+				nextBlocks, _ := messages[i].Content.([]interface{})
+				merged = append(merged, nextBlocks...)
+			}
+
+			if count > 1 {
+				logger.Info("[消息修复] 合并 %d 个连续的 tool_result user 消息为一条", count)
+				msg.Content = interface{}(merged)
+			}
+		}
+
+		result = append(result, msg)
+	}
+
+	return result
+}
+
+// isAllToolResults 检查消息内容是否全部为 tool_result 块
+func isAllToolResults(content interface{}) bool {
+	blocks, ok := content.([]interface{})
+	if !ok || len(blocks) == 0 {
+		return false
+	}
+	for _, block := range blocks {
+		m, ok := block.(map[string]interface{})
+		if !ok || m["type"] != "tool_result" {
+			return false
+		}
+	}
+	return true
+}
+
 // flattenToolReferencesForNoToolsRequest 当请求没有定义任何工具时，
 // 将历史和当前消息中的结构化 toolUses/toolResults 转换为纯文本。
 // 场景：客户端（如 Zed 编辑器的标题生成）发送请求时不携带工具定义，
@@ -389,6 +442,9 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 
 	// 修复孤立的 tool_result：为缺少对应 tool_use 的 tool_result 补充 assistant 消息
 	req.Messages = fixOrphanToolResults(req.Messages)
+
+	// 合并连续的 tool_result user 消息（某些客户端如 Claude Code 会将同一轮的多个 tool_result 拆成独立 user 消息）
+	req.Messages = mergeConsecutiveToolResults(req.Messages)
 
 	// 检测无限工具调用循环
 	if err := detectToolCallLoop(req.Messages, 3); err != nil {
