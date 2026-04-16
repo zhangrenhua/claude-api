@@ -78,6 +78,9 @@ func (s *Server) setupRoutes(r *gin.Engine) {
 	// 中间件顺序: IP限流(预检) -> 用户认证 -> API Key限流(后检) -> 业务处理
 	r.POST("/v1/chat/completions", s.preAuthRateLimitMiddleware(), s.requireAccount, s.postAuthRateLimitMiddleware(), s.handleChatCompletions)
 
+	// OpenAI Responses API 端点
+	r.POST("/v1/responses", s.preAuthRateLimitMiddleware(), s.requireAccount, s.postAuthRateLimitMiddleware(), s.handleResponses)
+
 	// 管理控制台端点（如果启用）
 	if s.cfg.EnableConsole {
 		s.setupConsoleRoutes(r)

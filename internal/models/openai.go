@@ -33,6 +33,9 @@ type OpenAITool struct {
 	Name        string                 `json:"name,omitempty"`
 	Description string                 `json:"description,omitempty"`
 	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
+
+	// Responses API 格式字段（工具参数在顶层）
+	Parameters map[string]interface{} `json:"parameters,omitempty"`
 }
 
 // OpenAIToolFunction 表示函数定义
@@ -95,5 +98,15 @@ type ChatCompletionChunkChoice struct {
 type ChatCompletionChunkDelta struct {
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
+}
+
+// ResponsesRequest 表示 OpenAI Responses API 请求
+type ResponsesRequest struct {
+	Model        string       `json:"model"`
+	Input        interface{}  `json:"input"`
+	Instructions string       `json:"instructions,omitempty"`
+	Stream       bool         `json:"stream,omitempty"`
+	Tools        []OpenAITool `json:"tools,omitempty"`
+	ToolChoice   interface{}  `json:"tool_choice,omitempty"`
 }
 

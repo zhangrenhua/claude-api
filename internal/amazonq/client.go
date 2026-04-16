@@ -251,7 +251,7 @@ const (
 	// DefaultIdleConnTimeout 空闲连接超时时间
 	DefaultIdleConnTimeout = 120 * time.Second
 	// DefaultResponseHeaderTimeout 响应头超时时间
-	DefaultResponseHeaderTimeout = 60 * time.Second
+	DefaultResponseHeaderTimeout = 120 * time.Second
 	// DefaultTLSHandshakeTimeout TLS 握手超时时间
 	DefaultTLSHandshakeTimeout = 15 * time.Second
 )

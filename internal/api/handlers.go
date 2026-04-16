@@ -3264,6 +3264,506 @@ func (s *Server) handleCountTokens(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"input_tokens": tokenCount})
 }
 
+// handleResponses 处理 OpenAI Responses API 端点
+func (s *Server) handleResponses(c *gin.Context) {
+	clientIP := c.ClientIP()
+	startTime := time.Now()
+	logger.Debug("处理 Responses 请求 - 来源: %s", clientIP)
+
+	account := getAccount(c)
+	if account == nil {
+		logger.Error("上下文中未找到账号 - Responses 请求")
+		c.JSON(500, gin.H{"error": "上下文中未找到账号"})
+		return
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败"})
+		return
+	}
+
+	logTimestamp := time.Now().Format("20060102_150405")
+	c.Set("log_timestamp", logTimestamp)
+	saveInLog(body, logTimestamp)
+	c.Set("raw_request_body", string(body))
+
+	var req models.ResponsesRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		logger.Warn("无效的 Responses 请求格式: %v", err)
+		c.JSON(400, gin.H{"error": fmt.Sprintf("Invalid request: %v", err)})
+		return
+	}
+
+	// 将 Responses API input 转换为 ChatMessage 数组
+	messages, err := convertResponsesInputToMessages(req.Input, req.Instructions)
+	if err != nil {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("Invalid input: %v", err)})
+		return
+	}
+
+	// 内部使用 ChatCompletionRequest 进行共用处理流程
+	chatReq := &models.ChatCompletionRequest{
+		Model:    req.Model,
+		Messages: messages,
+		Stream:   req.Stream,
+		Tools:    req.Tools,
+	}
+
+	// 强制模型替换逻辑
+	settings, _ := s.db.GetSettings(c.Request.Context())
+	if settings != nil && settings.ForceModelEnabled && settings.ForceModel != "" {
+		modelLower := strings.ToLower(chatReq.Model)
+		if !strings.Contains(modelLower, "haiku") {
+			originalModel := chatReq.Model
+			chatReq.Model = settings.ForceModel
+			logger.Info("[强制模型] Responses格式已替换模型: %s -> %s", originalModel, chatReq.Model)
+			c.Set("original_model", originalModel)
+		}
+	}
+
+	// 强制注入知识截止日期到 system 消息
+	{
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		foundSystem := false
+		for i, msg := range chatReq.Messages {
+			if msg.Role == "system" {
+				if text := extractOpenAIContent(msg.Content); text != "" {
+					chatReq.Messages[i].Content = text + knowledgeCutoff
+				}
+				foundSystem = true
+				break
+			}
+		}
+		if !foundSystem {
+			systemMsg := models.ChatMessage{
+				Role:    "system",
+				Content: knowledgeCutoff[2:],
+			}
+			chatReq.Messages = append([]models.ChatMessage{systemMsg}, chatReq.Messages...)
+		}
+	}
+
+	conversationID := uuid.New().String()
+	inputTokens := countOpenAIInputTokens(chatReq)
+
+	// 上下文压缩检查
+	if s.compressor != nil {
+		if settings != nil && settings.CompressionEnabled {
+			if settings.CompressionModel != "" {
+				s.compressor.SetSummaryModel(settings.CompressionModel)
+			}
+			s.compressor.UpdateConfig(settings.CompressionTokenLimit, settings.CompressionMessageLimit, settings.CompressionKeepMessages)
+
+			claudeReqForCheck := convertOpenAIToClaude(chatReq)
+			compressedReq, compressErr := s.compressor.CompressIfNeeded(c.Request.Context(), claudeReqForCheck,
+				func(ctx context.Context, content, model string) (string, error) {
+					return s.callSummaryAPI(ctx, content, model)
+				})
+			if compressErr != nil {
+				logger.Warn("[智能压缩] Responses格式压缩失败: %v", compressErr)
+			} else if compressedReq != nil {
+				chatReq.Messages = convertClaudeMessagesToOpenAI(compressedReq.Messages)
+				inputTokens = countOpenAIInputTokens(chatReq)
+				logger.Info("[智能压缩] Responses完成 - Token: %d, 消息数: %d", inputTokens, len(chatReq.Messages))
+			}
+		}
+	}
+
+	logger.Info("Responses 请求 - 模型: %s, 流式: %v, 消息数: %d, 工具数: %d", chatReq.Model, chatReq.Stream, len(chatReq.Messages), len(chatReq.Tools))
+
+	// 被动刷新策略：确保账号可用
+	account, err = s.EnsureAccountReady(c.Request.Context(), account)
+	if err != nil {
+		logger.Error("账号被动刷新失败: %v", err)
+		c.Set("error_message", "账号准备失败: "+err.Error())
+		c.JSON(502, gin.H{"error": "账号准备失败，请稍后重试"})
+		return
+	}
+	if account == nil || account.AccessToken == nil || *account.AccessToken == "" {
+		logger.Error("账号被动刷新后仍无访问令牌")
+		c.Set("error_message", "账号没有访问令牌")
+		c.JSON(503, gin.H{"error": "账号没有访问令牌，请确保账号有有效的刷新令牌"})
+		return
+	}
+
+	// 转换请求：OpenAI -> Claude -> Amazon Q
+	claudeReq := convertOpenAIToClaude(chatReq)
+	aqPayload, convErr := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
+	if convErr != nil {
+		logger.Error("请求转换失败 - 错误: %v", convErr)
+		c.Set("error_message", convErr.Error())
+		c.JSON(400, gin.H{"error": convErr.Error()})
+		return
+	}
+
+	c.Set("model", chatReq.Model)
+	c.Set("is_stream", chatReq.Stream)
+
+	responseID := "resp_" + uuid.New().String()[:8]
+	aqPayloadJSON, _ := json.MarshalIndent(aqPayload, "", "  ")
+	machineId := s.ensureAccountMachineID(c.Request.Context(), account)
+	resp, err := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
+	if err != nil {
+		logger.Error("Responses 请求失败 - 账号: %s, 错误: %v", account.ID, err)
+
+		if amazonq.IsNonRetriable(err) {
+			if nrErr, ok := err.(*amazonq.NonRetriableError); ok {
+				if nrErr.Code == "INVALID_REQUEST" {
+					rawBody, _ := c.Get("raw_request_body")
+					rawBodyStr, _ := rawBody.(string)
+					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+				}
+
+				if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {
+					logger.Error("【上下文超出】输入 Token: %d, 消息数: %d, 模型: %s", inputTokens, len(chatReq.Messages), chatReq.Model)
+
+					compressionSettings, _ := s.db.GetSettings(c.Request.Context())
+					if s.compressor != nil && compressionSettings != nil && compressionSettings.CompressionEnabled && !c.GetBool("compression_retried") {
+						c.Set("compression_retried", true)
+						logger.Info("[自动压缩重试] Responses接口 - 上游返回内容超限，尝试压缩后重试")
+						compressedReq, compressErr := s.compressor.ForceCompress(c.Request.Context(), claudeReq,
+							func(ctx context.Context, content, model string) (string, error) {
+								return s.callSummaryAPI(ctx, content, model)
+							})
+						if compressErr == nil && compressedReq != nil {
+							claudeReq = compressedReq
+							inputTokens, _, _ = countClaudeInputTokens(claudeReq)
+							aqPayload2, convErr2 := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
+							if convErr2 == nil {
+								resp2, err2 := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
+								if err2 == nil {
+									logger.Info("[自动压缩重试] Responses接口 - 压缩后重试成功 - Token: %d", inputTokens)
+									resp = resp2
+									err = nil
+									goto responsesHandleResponse
+								}
+								logger.Warn("[自动压缩重试] Responses接口 - 压缩后重试仍失败: %v", err2)
+							}
+						} else {
+							logger.Warn("[自动压缩重试] Responses接口 - 压缩失败: %v", compressErr)
+						}
+					}
+				}
+
+				if !nrErr.IsRequestErr {
+					s.QueueStatsUpdate(account.ID, false)
+					s.handleAccountStatusByError(c.Request.Context(), account.ID, nrErr.Code)
+				}
+				c.Set("error_message", nrErr.Message)
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": gin.H{
+						"message": nrErr.Message,
+						"type":    nrErr.Code,
+						"hint":    nrErr.Hint,
+					},
+				})
+				return
+			}
+		}
+
+		s.QueueStatsUpdate(account.ID, false)
+		c.Set("error_message", err.Error())
+		c.JSON(502, gin.H{"error": fmt.Sprintf("发送请求失败: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+responsesHandleResponse:
+	if chatReq.Stream {
+		s.handleResponsesStreamResponse(c, resp, chatReq.Model, responseID, clientIP, startTime, len(chatReq.Messages), account, inputTokens)
+	} else {
+		s.handleResponsesNonStreamResponse(c, resp, chatReq.Model, responseID, clientIP, startTime, account, len(chatReq.Messages), inputTokens)
+	}
+}
+
+func (s *Server) handleResponsesStreamResponse(c *gin.Context, resp *http.Response, model, responseID, clientIP string, startTime time.Time, msgCount int, acc *models.Account, inputTokens int) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	handler := stream.NewResponsesStreamHandler(responseID, model)
+	parser := stream.NewEventStreamParser()
+
+	reader := bufio.NewReader(resp.Body)
+	buf := make([]byte, 4096)
+
+	c.Stream(func(w io.Writer) bool {
+		n, err := reader.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				logger.Info("读取流错误 - 来源: %s, 错误: %v", clientIP, err)
+			}
+
+			outputTokens := handler.OutputTokens()
+			completedEvent := handler.BuildCompletedEvent(inputTokens, outputTokens)
+			w.Write([]byte(completedEvent))
+
+			duration := time.Since(startTime)
+			s.QueueStatsUpdate(acc.ID, true)
+			c.Set("input_tokens", inputTokens)
+			c.Set("output_tokens", outputTokens)
+
+			logger.Info("Responses 流式响应完成 - 来源: %s, 模型: %s, 消息数: %d, 输入token: %d, 输出token: %d, 耗时: %dms", clientIP, model, msgCount, inputTokens, outputTokens, duration.Milliseconds())
+			return false
+		}
+
+		events, err := parser.Feed(buf[:n])
+		if err != nil {
+			logger.Info("解析错误 - 来源: %s, 错误: %v", clientIP, err)
+			return false
+		}
+
+		for _, event := range events {
+			eventType := event.Headers[":event-type"]
+			if eventType == "" {
+				eventType = event.Headers["event-type"]
+			}
+
+			var payload map[string]interface{}
+			if len(event.Payload) > 0 {
+				if err := json.Unmarshal(event.Payload, &payload); err != nil {
+					logger.Warn("解析事件 payload 失败: %v", err)
+				}
+			}
+
+			sseEvents := handler.HandleEvent(eventType, payload)
+			for _, sse := range sseEvents {
+				w.Write([]byte(sse))
+			}
+		}
+
+		return true
+	})
+}
+
+func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Response, model, responseID, clientIP string, startTime time.Time, acc *models.Account, msgCount int, inputTokens int) {
+	defer resp.Body.Close()
+
+	parser := stream.NewEventStreamParser()
+	var fullContent string
+	var toolCalls []map[string]interface{}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error("读取响应体失败: %v", err)
+		c.JSON(500, gin.H{"error": map[string]interface{}{
+			"message": "读取响应失败",
+			"type":    "server_error",
+		}})
+		return
+	}
+	events, err := parser.Feed(body)
+	if err != nil {
+		logger.Error("解析响应事件失败: %v", err)
+		c.JSON(500, gin.H{"error": map[string]interface{}{
+			"message": "解析响应失败",
+			"type":    "server_error",
+		}})
+		return
+	}
+
+	for _, event := range events {
+		eventType := event.Headers[":event-type"]
+		if eventType == "" {
+			eventType = event.Headers["event-type"]
+		}
+
+		var payload map[string]interface{}
+		if len(event.Payload) > 0 {
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				logger.Warn("解析事件 payload 失败: %v", err)
+			}
+		}
+
+		if eventType == "assistantResponseEvent" {
+			if content, ok := payload["content"].(string); ok {
+				fullContent += content
+			}
+		} else if eventType == "codeReferenceEvent" {
+			if toolUses, ok := payload["toolUses"].([]interface{}); ok {
+				for _, tu := range toolUses {
+					if toolUse, ok := tu.(map[string]interface{}); ok {
+						toolCallID, _ := toolUse["toolUseId"].(string)
+						toolName, _ := toolUse["name"].(string)
+						toolInput, _ := toolUse["input"].(map[string]interface{})
+						inputJSON, _ := json.Marshal(toolInput)
+
+						toolCalls = append(toolCalls, map[string]interface{}{
+							"id":        toolCallID,
+							"name":      toolName,
+							"arguments": string(inputJSON),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// 品牌名替换
+	if len(fullContent) > 0 {
+		const brandLimit = 250
+		if len(fullContent) <= brandLimit {
+			fullContent = stream.ReplaceBranding(fullContent)
+		} else {
+			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+		}
+	}
+
+	promptTokens := inputTokens
+	completionTokens := tokenizer.CountTokens(fullContent)
+
+	// 构建 output 数组
+	messageID := "msg_" + responseID[5:]
+	var output []interface{}
+
+	if fullContent != "" {
+		output = append(output, map[string]interface{}{
+			"type":   "message",
+			"id":     messageID,
+			"status": "completed",
+			"role":   "assistant",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type":        "output_text",
+					"text":        fullContent,
+					"annotations": []interface{}{},
+				},
+			},
+		})
+	}
+
+	for _, tc := range toolCalls {
+		tcID := tc["id"].(string)
+		output = append(output, map[string]interface{}{
+			"type":      "function_call",
+			"id":        "fc_" + tcID,
+			"call_id":   tcID,
+			"name":      tc["name"],
+			"arguments": tc["arguments"],
+			"status":    "completed",
+		})
+	}
+
+	response := map[string]interface{}{
+		"id":         responseID,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"model":      model,
+		"status":     "completed",
+		"output":     output,
+		"usage": map[string]interface{}{
+			"input_tokens":  promptTokens,
+			"output_tokens": completionTokens,
+			"total_tokens":  promptTokens + completionTokens,
+		},
+	}
+
+	duration := time.Since(startTime)
+	s.QueueStatsUpdate(acc.ID, true)
+	c.Set("input_tokens", promptTokens)
+	c.Set("output_tokens", completionTokens)
+
+	logger.Info("Responses 非流式响应完成 - 来源: %s, 模型: %s, 消息数: %d, 输入token: %d, 输出token: %d, 耗时: %dms", clientIP, model, msgCount, promptTokens, completionTokens, duration.Milliseconds())
+
+	c.JSON(http.StatusOK, response)
+}
+
+// convertResponsesInputToMessages 将 Responses API 的 input 字段转换为 ChatMessage 数组
+func convertResponsesInputToMessages(input interface{}, instructions string) ([]models.ChatMessage, error) {
+	var messages []models.ChatMessage
+
+	// instructions 作为 system 消息
+	if instructions != "" {
+		messages = append(messages, models.ChatMessage{
+			Role:    "system",
+			Content: instructions,
+		})
+	}
+
+	switch v := input.(type) {
+	case string:
+		// 简单字符串 → 单条 user 消息
+		messages = append(messages, models.ChatMessage{
+			Role:    "user",
+			Content: v,
+		})
+
+	case []interface{}:
+		for _, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			itemType, _ := m["type"].(string)
+			role, _ := m["role"].(string)
+
+			switch itemType {
+			case "function_call":
+				// 上一轮 assistant 的工具调用
+				callID, _ := m["call_id"].(string)
+				name, _ := m["name"].(string)
+				args, _ := m["arguments"].(string)
+
+				tc := models.ToolCall{
+					ID:   callID,
+					Type: "function",
+					Function: models.FunctionCall{
+						Name:      name,
+						Arguments: args,
+					},
+				}
+
+				// 合并连续的 function_call 到同一个 assistant 消息
+				if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
+					if existing, ok := messages[len(messages)-1].ToolCalls.([]models.ToolCall); ok {
+						messages[len(messages)-1].ToolCalls = append(existing, tc)
+						continue
+					}
+				}
+
+				messages = append(messages, models.ChatMessage{
+					Role:      "assistant",
+					ToolCalls: []models.ToolCall{tc},
+				})
+
+			case "function_call_output":
+				// 工具返回结果
+				callID, _ := m["call_id"].(string)
+				output, _ := m["output"].(string)
+				messages = append(messages, models.ChatMessage{
+					Role:       "tool",
+					ToolCallID: callID,
+					Content:    output,
+				})
+
+			default:
+				// 普通消息（含 type:"message" 或无 type 的简写格式）
+				if role == "" {
+					continue
+				}
+				if role == "developer" {
+					role = "system"
+				}
+				messages = append(messages, models.ChatMessage{
+					Role:    role,
+					Content: m["content"],
+				})
+			}
+		}
+
+	default:
+		return nil, fmt.Errorf("input must be a string or array")
+	}
+
+	if len(messages) == 0 || (len(messages) == 1 && messages[0].Role == "system") {
+		return nil, fmt.Errorf("input is required")
+	}
+
+	return messages, nil
+}
+
 // handleConsoleChatTest 处理控制台聊天测试
 func (s *Server) handleConsoleChatTest(c *gin.Context) {
 	logger.Info("控制台聊天测试请求 - 来源: %s", c.ClientIP())
@@ -3486,13 +3986,19 @@ func convertOpenAIToClaude(req *models.ChatCompletionRequest) *models.ClaudeRequ
 					Description: tool.Function.Description,
 					InputSchema: tool.Function.Parameters,
 				})
-			} else if tool.Name != "" && tool.InputSchema != nil {
-				// 支持 Claude 原生格式
-				claudeReq.Tools = append(claudeReq.Tools, models.ClaudeTool{
-					Name:        tool.Name,
-					Description: tool.Description,
-					InputSchema: tool.InputSchema,
-				})
+			} else if tool.Name != "" {
+				// 支持 Claude 原生格式和 Responses API 格式
+				schema := tool.InputSchema
+				if schema == nil {
+					schema = tool.Parameters
+				}
+				if schema != nil {
+					claudeReq.Tools = append(claudeReq.Tools, models.ClaudeTool{
+						Name:        tool.Name,
+						Description: tool.Description,
+						InputSchema: schema,
+					})
+				}
 			}
 		}
 	}
