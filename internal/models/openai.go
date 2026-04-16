@@ -47,10 +47,15 @@ type OpenAIToolFunction struct {
 
 // ChatCompletionRequest 表示 OpenAI 聊天完成请求
 type ChatCompletionRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages" binding:"required"`
-	Stream   bool          `json:"stream,omitempty"`
-	Tools    []OpenAITool  `json:"tools,omitempty"`
+	Model               string        `json:"model"`
+	Messages            []ChatMessage `json:"messages" binding:"required"`
+	Stream              bool          `json:"stream,omitempty"`
+	Tools               []OpenAITool  `json:"tools,omitempty"`
+	MaxTokens           int           `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64      `json:"temperature,omitempty"`
+	TopP                *float64      `json:"top_p,omitempty"`
+	ToolChoice          interface{}   `json:"tool_choice,omitempty"`
 }
 
 // ChatCompletionResponse 表示非流式 OpenAI 响应
@@ -102,11 +107,15 @@ type ChatCompletionChunkDelta struct {
 
 // ResponsesRequest 表示 OpenAI Responses API 请求
 type ResponsesRequest struct {
-	Model        string       `json:"model"`
-	Input        interface{}  `json:"input"`
-	Instructions string       `json:"instructions,omitempty"`
-	Stream       bool         `json:"stream,omitempty"`
-	Tools        []OpenAITool `json:"tools,omitempty"`
-	ToolChoice   interface{}  `json:"tool_choice,omitempty"`
+	Model           string       `json:"model"`
+	Input           interface{}  `json:"input"`
+	Instructions    string       `json:"instructions,omitempty"`
+	Stream          bool         `json:"stream,omitempty"`
+	Tools           []OpenAITool `json:"tools,omitempty"`
+	ToolChoice      interface{}  `json:"tool_choice,omitempty"`
+	MaxOutputTokens int          `json:"max_output_tokens,omitempty"`
+	Temperature     *float64     `json:"temperature,omitempty"`
+	TopP            *float64     `json:"top_p,omitempty"`
+	Reasoning       interface{}  `json:"reasoning,omitempty"` // {"effort":"high"} → Claude thinking
 }
 

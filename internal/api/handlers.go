@@ -3304,10 +3304,14 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 	// 内部使用 ChatCompletionRequest 进行共用处理流程
 	chatReq := &models.ChatCompletionRequest{
-		Model:    req.Model,
-		Messages: messages,
-		Stream:   req.Stream,
-		Tools:    req.Tools,
+		Model:       req.Model,
+		Messages:    messages,
+		Stream:      req.Stream,
+		Tools:       req.Tools,
+		MaxTokens:   req.MaxOutputTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		ToolChoice:  req.ToolChoice,
 	}
 
 	// 强制模型替换逻辑
@@ -3389,6 +3393,16 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 	// 转换请求：OpenAI -> Claude -> Amazon Q
 	claudeReq := convertOpenAIToClaude(chatReq)
+
+	// 转发 reasoning → thinking
+	if req.Reasoning != nil {
+		if rm, ok := req.Reasoning.(map[string]interface{}); ok {
+			if effort, _ := rm["effort"].(string); effort == "high" || effort == "medium" {
+				claudeReq.Thinking = map[string]interface{}{"type": "enabled", "budget_tokens": 16000}
+			}
+		}
+	}
+
 	aqPayload, convErr := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
 	if convErr != nil {
 		logger.Error("请求转换失败 - 错误: %v", convErr)
@@ -3715,12 +3729,14 @@ func convertResponsesInputToMessages(input interface{}, instructions string) ([]
 					},
 				}
 
-				// 合并连续的 function_call 到同一个 assistant 消息
+				// 合并到前一个 assistant 消息（无论已有 ToolCalls 还是只有 Content）
 				if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
 					if existing, ok := messages[len(messages)-1].ToolCalls.([]models.ToolCall); ok {
 						messages[len(messages)-1].ToolCalls = append(existing, tc)
-						continue
+					} else {
+						messages[len(messages)-1].ToolCalls = []models.ToolCall{tc}
 					}
+					continue
 				}
 
 				messages = append(messages, models.ChatMessage{
@@ -3746,9 +3762,22 @@ func convertResponsesInputToMessages(input interface{}, instructions string) ([]
 				if role == "developer" {
 					role = "system"
 				}
+				// 规范化 Responses API content 类型: input_text → text, input_image → image
+				content := m["content"]
+				if contentArr, ok := content.([]interface{}); ok {
+					for i, part := range contentArr {
+						if partMap, ok := part.(map[string]interface{}); ok {
+							if partType, _ := partMap["type"].(string); strings.HasPrefix(partType, "input_") {
+								partMap["type"] = strings.TrimPrefix(partType, "input_")
+								contentArr[i] = partMap
+							}
+						}
+					}
+					content = contentArr
+				}
 				messages = append(messages, models.ChatMessage{
 					Role:    role,
-					Content: m["content"],
+					Content: content,
 				})
 			}
 		}
@@ -3921,56 +3950,104 @@ func convertOpenAIToClaude(req *models.ChatCompletionRequest) *models.ClaudeRequ
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
 			system = extractOpenAIContent(msg.Content)
-		} else {
-			claudeMsg := models.ClaudeMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
-			}
-
-			// 转换 tool_calls 为 Claude 格式
-			if toolCalls, ok := msg.ToolCalls.([]models.ToolCall); ok && len(toolCalls) > 0 {
-				var content []interface{}
-				if text := extractOpenAIContent(msg.Content); text != "" {
-					content = append(content, map[string]interface{}{
-						"type": "text",
-						"text": text,
-					})
-				}
-				for _, tc := range toolCalls {
-					var input map[string]interface{}
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
-						logger.Warn("解析工具调用参数失败: %v", err)
-					}
-					content = append(content, map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tc.ID,
-						"name":  tc.Function.Name,
-						"input": input,
-					})
-				}
-				claudeMsg.Content = content
-			}
-
-			// 转换 tool_call_id 为 Claude 格式
-			if msg.ToolCallID != "" {
-				claudeMsg.Content = []interface{}{
-					map[string]interface{}{
-						"type":        "tool_result",
-						"tool_use_id": msg.ToolCallID,
-						"content":     extractOpenAIContent(msg.Content),
-					},
-				}
-			}
-
-			messages = append(messages, claudeMsg)
+			continue
 		}
+
+		claudeMsg := models.ClaudeMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		}
+
+		// 转换 tool_calls 为 Claude 格式
+		if toolCalls, ok := msg.ToolCalls.([]models.ToolCall); ok && len(toolCalls) > 0 {
+			var content []interface{}
+			if text := extractOpenAIContent(msg.Content); text != "" {
+				content = append(content, map[string]interface{}{
+					"type": "text",
+					"text": text,
+				})
+			}
+			for _, tc := range toolCalls {
+				var input map[string]interface{}
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+					logger.Warn("解析工具调用参数失败: %v", err)
+				}
+				content = append(content, map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tc.ID,
+					"name":  tc.Function.Name,
+					"input": input,
+				})
+			}
+			claudeMsg.Content = content
+		}
+
+		// 转换 tool_call_id 为 Claude 格式（tool role → user role）
+		// 合并连续的 tool_result 到同一个 user 消息，避免被 ConvertClaudeToAmazonQ 拆散
+		if msg.ToolCallID != "" {
+			toolResult := map[string]interface{}{
+				"type":        "tool_result",
+				"tool_use_id": msg.ToolCallID,
+				"content":     extractOpenAIContent(msg.Content),
+			}
+
+			// 尝试合并到前一个已有 tool_result 的 user 消息
+			if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
+				if prevContent, ok := messages[len(messages)-1].Content.([]interface{}); ok && len(prevContent) > 0 {
+					if firstBlock, ok := prevContent[0].(map[string]interface{}); ok && firstBlock["type"] == "tool_result" {
+						messages[len(messages)-1].Content = append(prevContent, toolResult)
+						continue
+					}
+				}
+			}
+
+			claudeMsg.Role = "user"
+			claudeMsg.Content = []interface{}{toolResult}
+		}
+
+		messages = append(messages, claudeMsg)
+	}
+
+	// 确定 max_tokens：优先用户指定值，否则默认 16384
+	maxTokens := 16384
+	if req.MaxTokens > 0 {
+		maxTokens = req.MaxTokens
+	} else if req.MaxCompletionTokens > 0 {
+		maxTokens = req.MaxCompletionTokens
 	}
 
 	claudeReq := &models.ClaudeRequest{
-		Model:     req.Model,
-		Messages:  messages,
-		MaxTokens: 4096,
-		Stream:    req.Stream,
+		Model:       req.Model,
+		Messages:    messages,
+		MaxTokens:   maxTokens,
+		Temperature: req.Temperature,
+		Stream:      req.Stream,
+	}
+
+	// 转发 tool_choice
+	if req.ToolChoice != nil {
+		switch tc := req.ToolChoice.(type) {
+		case string:
+			switch tc {
+			case "required":
+				claudeReq.ToolChoice = map[string]interface{}{"type": "any"}
+			case "auto":
+				claudeReq.ToolChoice = map[string]interface{}{"type": "auto"}
+			}
+		case map[string]interface{}:
+			if tc["type"] == "function" {
+				// Chat Completions 格式: {"type":"function","function":{"name":"xxx"}}
+				if fn, ok := tc["function"].(map[string]interface{}); ok {
+					if name, ok := fn["name"].(string); ok {
+						claudeReq.ToolChoice = map[string]interface{}{"type": "tool", "name": name}
+					}
+				}
+				// Responses API 格式: {"type":"function","name":"xxx"}
+				if name, ok := tc["name"].(string); ok && tc["function"] == nil {
+					claudeReq.ToolChoice = map[string]interface{}{"type": "tool", "name": name}
+				}
+			}
+		}
 	}
 
 	if system != "" {
