@@ -18,13 +18,19 @@ const (
 // 1. Kiro → Claude
 // 2. 上游可能返回的模型名（如 "Claude Sonnet"、"Claude 3.5 Sonnet"、"claude-3-5-sonnet-20241022"）→ "Claude Opus"
 func ReplaceBranding(text string) string {
-	const brandName = "Claude Opus 4"
-	// Kiro → Claude（忽略大小写）
-	text = kiroPattern.ReplaceAllString(text, "Claude")
-	// 模型名替换：统一替换为 "Claude Opus"，顺序：长匹配优先
-	text = modelWithParenPattern.ReplaceAllString(text, brandName)
-	text = modelFriendlyPattern.ReplaceAllString(text, brandName)
-	text = modelIDPattern.ReplaceAllString(text, brandName)
+	return replaceBrandingWith(text, "Claude", "Claude Opus 4")
+}
+
+// ReplaceOpenAIBranding 替换品牌名为 ChatGPT 5（用于 /v1/chat/completions 和 /v1/responses）
+func ReplaceOpenAIBranding(text string) string {
+	return replaceBrandingWith(text, "ChatGPT 5", "ChatGPT 5")
+}
+
+func replaceBrandingWith(text, kiroReplacement, modelReplacement string) string {
+	text = kiroPattern.ReplaceAllString(text, kiroReplacement)
+	text = modelWithParenPattern.ReplaceAllString(text, modelReplacement)
+	text = modelFriendlyPattern.ReplaceAllString(text, modelReplacement)
+	text = modelIDPattern.ReplaceAllString(text, modelReplacement)
 	return text
 }
 
@@ -48,6 +54,15 @@ var (
 // charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的尾部
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
 func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
+	return replaceInContent(content, charsSoFar, pending, ReplaceBranding)
+}
+
+// replaceOpenAIBrandInContent 流式品牌替换（OpenAI/Responses 端点用 ChatGPT 5）
+func replaceOpenAIBrandInContent(content string, charsSoFar int, pending string) (string, int, string) {
+	return replaceInContent(content, charsSoFar, pending, ReplaceOpenAIBranding)
+}
+
+func replaceInContent(content string, charsSoFar int, pending string, replacer func(string) string) (string, int, string) {
 	const replaceLimit = 200
 
 	// 已超过上限，不再替换，flush pending 并直接透传
@@ -74,7 +89,7 @@ func replaceKiroInContent(content string, charsSoFar int, pending string) (strin
 	}
 
 	// 替换
-	replaced := ReplaceBranding(toProcess)
+	replaced := replacer(toProcess)
 
 	if passThrough == "" {
 		// 还在范围内：智能检测尾部是否需要缓冲

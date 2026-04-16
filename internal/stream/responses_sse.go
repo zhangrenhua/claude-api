@@ -29,6 +29,10 @@ type ResponsesStreamHandler struct {
 	OutputDeltaCount  int
 	ContentCharCount  int
 	PendingKiroBuffer string
+
+	// thinking 过滤
+	InThinking  bool
+	ThinkBuffer string
 }
 
 type responsesToolCallInfo struct {
@@ -102,6 +106,12 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 			break
 		}
 
+		// 过滤 <thinking>...</thinking> 内容
+		content = h.filterThinking(content)
+		if content == "" {
+			break
+		}
+
 		events = append(events, h.ensureStarted()...)
 
 		// 首次文本：发送 output_item.added 和 content_part.added
@@ -133,7 +143,7 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 		}
 
 		// 品牌名替换
-		content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
+		content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 
 		h.OutputDeltaCount++
 		h.ResponseBuffer = append(h.ResponseBuffer, content)
@@ -437,4 +447,66 @@ func (h *ResponsesStreamHandler) OutputTokens() int {
 // ResponseText 返回已累计的响应文本
 func (h *ResponsesStreamHandler) ResponseText() string {
 	return strings.Join(h.ResponseBuffer, "")
+}
+
+// filterThinking 过滤流式内容中的 <thinking>...</thinking> 块
+// 返回 thinking 块之外的文本内容，thinking 内容被丢弃
+func (h *ResponsesStreamHandler) filterThinking(content string) string {
+	h.ThinkBuffer += content
+	var result string
+
+	for h.ThinkBuffer != "" {
+		if h.InThinking {
+			endIdx := strings.Index(h.ThinkBuffer, ThinkingEndTag)
+			if endIdx == -1 {
+				// 还在 thinking 中，检查末尾是否有部分结束标签
+				pending := pendingTagSuffix(h.ThinkBuffer, ThinkingEndTag)
+				if pending > 0 {
+					h.ThinkBuffer = h.ThinkBuffer[len(h.ThinkBuffer)-pending:]
+				} else {
+					h.ThinkBuffer = ""
+				}
+				return result
+			}
+			h.InThinking = false
+			h.ThinkBuffer = h.ThinkBuffer[endIdx+len(ThinkingEndTag):]
+			continue
+		}
+
+		startIdx := strings.Index(h.ThinkBuffer, ThinkingStartTag)
+		if startIdx == -1 {
+			// 无 thinking 标签，检查末尾部分匹配
+			pending := pendingTagSuffix(h.ThinkBuffer, ThinkingStartTag)
+			if pending > 0 {
+				result += h.ThinkBuffer[:len(h.ThinkBuffer)-pending]
+				h.ThinkBuffer = h.ThinkBuffer[len(h.ThinkBuffer)-pending:]
+			} else {
+				result += h.ThinkBuffer
+				h.ThinkBuffer = ""
+			}
+			return result
+		}
+
+		result += h.ThinkBuffer[:startIdx]
+		h.ThinkBuffer = h.ThinkBuffer[startIdx+len(ThinkingStartTag):]
+		h.InThinking = true
+	}
+
+	return result
+}
+
+// StripThinkingTags 从完整文本中移除所有 <thinking>...</thinking> 块（用于非流式响应）
+func StripThinkingTags(text string) string {
+	for {
+		start := strings.Index(text, ThinkingStartTag)
+		if start == -1 {
+			return strings.TrimSpace(text)
+		}
+		end := strings.Index(text[start:], ThinkingEndTag)
+		if end == -1 {
+			// 没有闭合标签，移除从 start 到末尾
+			return strings.TrimSpace(text[:start])
+		}
+		text = text[:start] + text[start+end+len(ThinkingEndTag):]
+	}
 }

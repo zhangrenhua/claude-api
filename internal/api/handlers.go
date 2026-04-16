@@ -3198,9 +3198,9 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 	if len(fullContent) > 0 {
 		const brandLimit = 250
 		if len(fullContent) <= brandLimit {
-			fullContent = stream.ReplaceBranding(fullContent)
+			fullContent = stream.ReplaceOpenAIBranding(fullContent)
 		} else {
-			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+			fullContent = stream.ReplaceOpenAIBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
 		}
 	}
 
@@ -3614,13 +3614,20 @@ func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Res
 		}
 	}
 
+	// 剥离 <thinking>...</thinking> 块
+	fullContent = stream.StripThinkingTags(fullContent)
+
+	// 剥离注入的知识截止提示词
+	fullContent = strings.ReplaceAll(fullContent, "你的知识库截止日期是 2025 年 5 月。", "")
+	fullContent = strings.TrimSpace(fullContent)
+
 	// 品牌名替换
 	if len(fullContent) > 0 {
 		const brandLimit = 250
 		if len(fullContent) <= brandLimit {
-			fullContent = stream.ReplaceBranding(fullContent)
+			fullContent = stream.ReplaceOpenAIBranding(fullContent)
 		} else {
-			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+			fullContent = stream.ReplaceOpenAIBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
 		}
 	}
 

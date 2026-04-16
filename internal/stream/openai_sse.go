@@ -108,7 +108,7 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 		content, _ := payload["content"].(string)
 		if content != "" {
 			// 前200个字符内做品牌名和模型名替换
-			content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
+			content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 			// 每个 assistantResponseEvent 对应一个 token（参考 anthropic-tokenizer 项目）
 			h.OutputDeltaCount++
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
