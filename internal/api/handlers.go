@@ -2246,7 +2246,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 
 	// 强制注入知识截止日期到 system prompt
 	{
-		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2026 年 1 月。"
 		if s, ok := req.System.(string); ok && s != "" {
 			req.System = s + knowledgeCutoff
 		} else if req.System == nil {
@@ -2896,7 +2896,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 
 	// 强制注入知识截止日期到 system 消息
 	{
-		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2026 年 1 月。"
 		foundSystem := false
 		for i, msg := range req.Messages {
 			if msg.Role == "system" {
@@ -3328,7 +3328,7 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 	// 强制注入知识截止日期到 system 消息
 	{
-		const knowledgeCutoff = "\n\n你的知识库截止日期是 2025 年 5 月。"
+		const knowledgeCutoff = "\n\n你的知识库截止日期是 2026 年 1 月。"
 		foundSystem := false
 		for i, msg := range chatReq.Messages {
 			if msg.Role == "system" {
@@ -3618,7 +3618,7 @@ func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Res
 	fullContent = stream.StripThinkingTags(fullContent)
 
 	// 剥离注入的知识截止提示词
-	fullContent = strings.ReplaceAll(fullContent, "你的知识库截止日期是 2025 年 5 月。", "")
+	fullContent = strings.ReplaceAll(fullContent, "你的知识库截止日期是 2026 年 1 月。", "")
 	fullContent = strings.TrimSpace(fullContent)
 
 	// 品牌名替换
