@@ -4,6 +4,8 @@ import (
 	"claude-api/internal/logger"
 	"claude-api/internal/models"
 	"claude-api/internal/utils"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"runtime"
@@ -195,6 +197,101 @@ func detectToolCallLoop(messages []models.ClaudeMessage, threshold int) error {
 	}
 
 	return nil
+}
+
+// isValidToolUseID 判断 tool_use_id 是否符合上游接受的格式
+// 上游（Amazon Q/CodeWhisperer）拒绝含 `:`、`.`、`$` 或以工具名前缀的 ID（如 `Bash:19`、`functions.Read:0`、`$AskUserQuestion`）
+// 合法 ID 为字母数字和 `_`/`-` 的组合，不能包含上述特殊字符。
+func isValidToolUseID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if r == ':' || r == '.' || r == '$' || r == ' ' || r == '/' {
+			return false
+		}
+	}
+	return true
+}
+
+// generateToolUseID 生成符合上游规范的新 tool_use_id（`toolu_` + 24 位十六进制随机串）
+func generateToolUseID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// 兜底：使用时间戳；虽不理想但仍符合字符集要求
+		return fmt.Sprintf("toolu_%d", time.Now().UnixNano())
+	}
+	return "toolu_" + hex.EncodeToString(b[:])
+}
+
+// sanitizeToolUseIDs 扫描所有消息，将不合法的 tool_use.id 替换为合法 ID，
+// 并同步更新 user 消息中 tool_result.tool_use_id 的引用。
+// 这是为修复 Amazon Q 对形如 `Bash:19`、`functions.Read:0`、`$AskUserQuestion` 等 ID 返回
+// "Improperly formed request" ValidationException 的问题。
+func sanitizeToolUseIDs(messages []models.ClaudeMessage) {
+	if len(messages) == 0 {
+		return
+	}
+
+	// 第一遍：找出所有 assistant tool_use 的不合法 ID，生成映射
+	idMap := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		blocks, ok := msg.Content.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, block := range blocks {
+			m, ok := block.(map[string]interface{})
+			if !ok || m["type"] != "tool_use" {
+				continue
+			}
+			id, _ := m["id"].(string)
+			if isValidToolUseID(id) {
+				continue
+			}
+			if _, exists := idMap[id]; exists {
+				continue
+			}
+			idMap[id] = generateToolUseID()
+		}
+	}
+
+	if len(idMap) == 0 {
+		return
+	}
+
+	// 第二遍：应用映射到 assistant tool_use.id 与 user tool_result.tool_use_id
+	for _, msg := range messages {
+		blocks, ok := msg.Content.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, block := range blocks {
+			m, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch m["type"] {
+			case "tool_use":
+				if oldID, _ := m["id"].(string); oldID != "" {
+					if newID, ok := idMap[oldID]; ok {
+						m["id"] = newID
+					}
+				}
+			case "tool_result":
+				if oldID, _ := m["tool_use_id"].(string); oldID != "" {
+					if newID, ok := idMap[oldID]; ok {
+						m["tool_use_id"] = newID
+					}
+				}
+			}
+		}
+	}
+
+	logger.Info("[消息修复] 清洗 %d 个非法 tool_use_id，映射到 toolu_ 规范格式", len(idMap))
 }
 
 // fixOrphanToolResults 清理孤立的 tool_result
@@ -440,6 +537,10 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		conversationID = uuid.New().String()
 	}
 
+	// 清洗非法的 tool_use_id（形如 Bash:19、functions.Read:0、$AskUserQuestion），
+	// 上游会对这类 ID 返回 "Improperly formed request"。在所有其他修复之前执行。
+	sanitizeToolUseIDs(req.Messages)
+
 	// 修复孤立的 tool_result：为缺少对应 tool_use 的 tool_result 补充 assistant 消息
 	req.Messages = fixOrphanToolResults(req.Messages)
 
@@ -476,6 +577,22 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		}
 		// 递归清理 inputSchema 中 Amazon Q 不接受的字段
 		inputSchema := sanitizeJSONSchema(t.InputSchema)
+
+		// 兜底：若清理后仍为空对象或缺少 type 字段，填充最小合法 JSON Schema，
+		// 避免上游因 `inputSchema.json = {}` 抛 "Improperly formed request"。
+		if len(inputSchema) == 0 {
+			inputSchema = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+			logger.Debug("[消息转换] 工具 %s 的 input_schema 为空，填充最小合法 schema", t.Name)
+		} else if _, hasType := inputSchema["type"]; !hasType {
+			inputSchema["type"] = "object"
+			if _, hasProps := inputSchema["properties"]; !hasProps {
+				inputSchema["properties"] = map[string]interface{}{}
+			}
+			logger.Debug("[消息转换] 工具 %s 的 input_schema 缺少 type，补齐为 object", t.Name)
+		}
 
 		aqTools = append(aqTools, models.Tool{
 			ToolSpecification: models.ToolSpecification{

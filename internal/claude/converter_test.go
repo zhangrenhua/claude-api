@@ -1149,3 +1149,251 @@ func TestConvertClaudeToAmazonQ_MCPTools(t *testing.T) {
 	t.Logf("MCP 工具请求转换成功 - 工具数: %d, 历史消息数: %d",
 		len(tools), len(history))
 }
+
+// TestSanitizeToolUseIDs_RewritesInvalidIDs 验证非标 tool_use_id 被替换为合法格式，
+// 且对应的 tool_result.tool_use_id 同步更新
+func TestSanitizeToolUseIDs_RewritesInvalidIDs(t *testing.T) {
+	badIDs := []string{
+		"Bash:19",
+		"functions.Read:0",
+		"toolu_functions.Grep:21",
+		"$AskUserQuestion",
+	}
+	msgs := []models.ClaudeMessage{
+		{Role: "user", Content: "run tools"},
+	}
+	for _, id := range badIDs {
+		msgs = append(msgs,
+			models.ClaudeMessage{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "tool_use", "id": id, "name": "Bash",
+						"input": map[string]interface{}{"command": "ls"},
+					},
+				},
+			},
+			models.ClaudeMessage{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "tool_result", "tool_use_id": id,
+						"content": "ok",
+					},
+				},
+			},
+		)
+	}
+
+	sanitizeToolUseIDs(msgs)
+
+	// 遍历 assistant 块收集新 ID，再和 user tool_result 的 id 比对
+	var newIDs []string
+	for _, m := range msgs {
+		if m.Role != "assistant" {
+			continue
+		}
+		blocks := m.Content.([]interface{})
+		for _, b := range blocks {
+			mp := b.(map[string]interface{})
+			if mp["type"] == "tool_use" {
+				id := mp["id"].(string)
+				if !isValidToolUseID(id) {
+					t.Errorf("tool_use.id 仍然非法: %q", id)
+				}
+				if !strings.HasPrefix(id, "toolu_") {
+					t.Errorf("tool_use.id 应以 toolu_ 开头: %q", id)
+				}
+				newIDs = append(newIDs, id)
+			}
+		}
+	}
+
+	// 每个 tool_result 的 id 应与对应位置的 tool_use 一致
+	resultIdx := 0
+	for _, m := range msgs {
+		if m.Role != "user" {
+			continue
+		}
+		blocks, ok := m.Content.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			mp := b.(map[string]interface{})
+			if mp["type"] == "tool_result" {
+				got := mp["tool_use_id"].(string)
+				if got != newIDs[resultIdx] {
+					t.Errorf("tool_result[%d].tool_use_id 应为 %q, got %q",
+						resultIdx, newIDs[resultIdx], got)
+				}
+				resultIdx++
+			}
+		}
+	}
+	if resultIdx != len(badIDs) {
+		t.Errorf("预期 %d 个 tool_result 被重写，实际 %d", len(badIDs), resultIdx)
+	}
+}
+
+// TestSanitizeToolUseIDs_KeepsValidIDs 合法 ID 应保持不变
+func TestSanitizeToolUseIDs_KeepsValidIDs(t *testing.T) {
+	msgs := []models.ClaudeMessage{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{
+				"type": "tool_use", "id": "toolu_01ABC", "name": "Read",
+				"input": map[string]interface{}{},
+			},
+			map[string]interface{}{
+				"type": "tool_use", "id": "call_XYZ123", "name": "Bash",
+				"input": map[string]interface{}{},
+			},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_01ABC", "content": "ok"},
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "call_XYZ123", "content": "ok"},
+		}},
+	}
+
+	sanitizeToolUseIDs(msgs)
+
+	blocks := msgs[1].Content.([]interface{})
+	if blocks[0].(map[string]interface{})["id"] != "toolu_01ABC" {
+		t.Error("合法 toolu_ ID 不应被改写")
+	}
+	if blocks[1].(map[string]interface{})["id"] != "call_XYZ123" {
+		t.Error("合法 call_ ID 不应被改写")
+	}
+}
+
+// TestConvertClaudeToAmazonQ_EmptyInputSchemaFallback 验证 input_schema={} 时补齐最小合法 schema
+func TestConvertClaudeToAmazonQ_EmptyInputSchemaFallback(t *testing.T) {
+	req := &models.ClaudeRequest{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+		Messages:  []models.ClaudeMessage{{Role: "user", Content: "search"}},
+		Tools: []models.ClaudeTool{
+			{
+				Name:        "web_search",
+				Description: "search the web",
+				InputSchema: map[string]interface{}{}, // 空对象
+			},
+		},
+	}
+
+	result, err := ConvertClaudeToAmazonQ(req, "", false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+
+	tools := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools
+	if len(tools) != 1 {
+		t.Fatalf("应有 1 个工具，got %d", len(tools))
+	}
+	schema := tools[0].ToolSpecification.InputSchema.JSON
+	if schema["type"] != "object" {
+		t.Errorf("schema.type 应为 'object', got %v", schema["type"])
+	}
+	if _, ok := schema["properties"]; !ok {
+		t.Error("schema 应包含 properties 字段")
+	}
+
+	// 序列化后 properties 应为空对象而非缺失
+	data, _ := json.Marshal(schema)
+	if !strings.Contains(string(data), `"properties":{}`) {
+		t.Errorf("properties 应序列化为 {}, got: %s", string(data))
+	}
+}
+
+// TestConvertClaudeToAmazonQ_InputSchemaMissingType 验证缺 type 字段时补齐
+func TestConvertClaudeToAmazonQ_InputSchemaMissingType(t *testing.T) {
+	req := &models.ClaudeRequest{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+		Messages:  []models.ClaudeMessage{{Role: "user", Content: "hi"}},
+		Tools: []models.ClaudeTool{
+			{
+				Name:        "x",
+				Description: "x",
+				InputSchema: map[string]interface{}{
+					"properties": map[string]interface{}{"q": map[string]interface{}{"type": "string"}},
+				},
+			},
+		},
+	}
+	result, err := ConvertClaudeToAmazonQ(req, "", false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	schema := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.InputSchema.JSON
+	if schema["type"] != "object" {
+		t.Errorf("缺 type 时应补 object, got %v", schema["type"])
+	}
+}
+
+// TestConvertClaudeToAmazonQ_SanitizesBadToolIDsEndToEnd 端到端验证：
+// 客户端请求里含 `Bash:19` 风格 ID，经转换后上游 payload 全部为合法 ID
+func TestConvertClaudeToAmazonQ_SanitizesBadToolIDsEndToEnd(t *testing.T) {
+	req := &models.ClaudeRequest{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+		Messages: []models.ClaudeMessage{
+			{Role: "user", Content: "do it"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{
+					"type": "tool_use", "id": "Bash:19", "name": "Bash",
+					"input": map[string]interface{}{"command": "ls"},
+				},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type": "tool_result", "tool_use_id": "Bash:19", "content": "ok",
+				},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "done"},
+			}},
+			{Role: "user", Content: "thanks"},
+		},
+		Tools: []models.ClaudeTool{
+			{
+				Name:        "Bash",
+				Description: "run a command",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+	}
+
+	result, err := ConvertClaudeToAmazonQ(req, "", false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+
+	// 序列化整个上游 payload，断言不含原始非法 ID
+	data, _ := json.Marshal(result)
+	if strings.Contains(string(data), "Bash:19") {
+		t.Errorf("上游 payload 不应含原始非法 ID 'Bash:19':\n%s", string(data))
+	}
+
+	// history 中所有 toolUseId / tool_result.toolUseId 应合法
+	for i, h := range result.ConversationState.History {
+		if h.AssistantResponseMessage != nil {
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				if !isValidToolUseID(tu.ToolUseID) {
+					t.Errorf("history[%d] assistant toolUseID 非法: %q", i, tu.ToolUseID)
+				}
+			}
+		}
+		if h.UserInputMessage != nil {
+			for _, tr := range h.UserInputMessage.UserInputMessageContext.ToolResults {
+				if !isValidToolUseID(tr.ToolUseID) {
+					t.Errorf("history[%d] user toolResult.ToolUseID 非法: %q", i, tr.ToolUseID)
+				}
+			}
+		}
+	}
+}
