@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"claude-api/internal/tokenizer"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,6 +28,7 @@ type ResponsesStreamHandler struct {
 
 	// token 计数
 	OutputDeltaCount  int
+	AllToolInputs     []string
 	ContentCharCount  int
 	PendingKiroBuffer string
 
@@ -106,6 +108,9 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 			break
 		}
 
+		// 按原始内容累计 token（含 thinking，因为上游实际消耗了这些 token）
+		h.OutputDeltaCount += tokenizer.CountTokens(content)
+
 		// 过滤 <thinking>...</thinking> 内容
 		content = h.filterThinking(content)
 		if content == "" {
@@ -145,7 +150,6 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 		// 品牌名替换
 		content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
 
-		h.OutputDeltaCount++
 		h.ResponseBuffer = append(h.ResponseBuffer, content)
 
 		events = append(events, h.buildEvent("response.output_text.delta", map[string]interface{}{
@@ -167,6 +171,9 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 		if toolCallID != "" && toolName != "" && h.CurrentToolCall == nil {
 			if !h.ProcessedToolUseIDs[toolCallID] {
 				h.ProcessedToolUseIDs[toolCallID] = true
+
+				// 工具名也算 output token（上游吐出的内容）
+				h.OutputDeltaCount += tokenizer.CountTokens(toolName)
 
 				// 先结束文本内容
 				if h.TextStarted {
@@ -210,6 +217,8 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 
 			if fragment != "" {
 				h.CurrentToolCall.ArgumentsJSON = append(h.CurrentToolCall.ArgumentsJSON, fragment)
+				h.AllToolInputs = append(h.AllToolInputs, fragment)
+				h.OutputDeltaCount += tokenizer.CountTokens(fragment)
 
 				events = append(events, h.buildEvent("response.function_call_arguments.delta", map[string]interface{}{
 					"item_id":      h.CurrentToolCall.ID,
@@ -273,6 +282,10 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 				h.OutputIndex++
 				fcID := "fc_" + toolCallID
 				inputJSON, _ := json.Marshal(toolInput)
+
+				// codeReferenceEvent 一次性给出完整 tool_use，整块计入 output token
+				h.AllToolInputs = append(h.AllToolInputs, string(inputJSON))
+				h.OutputDeltaCount += tokenizer.CountTokens(toolName + string(inputJSON))
 
 				events = append(events, h.buildEvent("response.output_item.added", map[string]interface{}{
 					"output_index": h.OutputIndex,
@@ -432,16 +445,20 @@ func (h *ResponsesStreamHandler) BuildCompletedEvent(inputTokens, outputTokens i
 	})
 }
 
-// OutputTokens 返回基于流式事件的输出 token 数（乘以2倍系数）
+// OutputTokens 返回基于流式事件的输出 token 数
+// 纯工具调用、纯 thinking 场景也能正确计数
 func (h *ResponsesStreamHandler) OutputTokens() int {
-	var tokens int
 	if h.OutputDeltaCount > 0 {
-		tokens = h.OutputDeltaCount
-	} else {
-		responseText := strings.Join(h.ResponseBuffer, "")
-		tokens = len(responseText) / 4
+		return h.OutputDeltaCount
 	}
-	return tokens * 2
+	// 回退到完整文本估算（含工具输入）
+	fullText := strings.Join(h.ResponseBuffer, "")
+	fullToolInput := strings.Join(h.AllToolInputs, "")
+	tokens := tokenizer.CountTokens(fullText + fullToolInput)
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
 }
 
 // ResponseText 返回已累计的响应文本

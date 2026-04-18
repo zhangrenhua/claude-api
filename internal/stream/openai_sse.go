@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"claude-api/internal/tokenizer"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -52,9 +53,9 @@ type OpenAIStreamHandler struct {
 	ToolCallIndex       int
 	CurrentToolCall     *ToolCallState
 	ProcessedToolUseIDs map[string]bool
-	// token 计数（基于流式 delta 事件，更准确）
-	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
+	// token 计数（使用 tokenizer 实际统计，覆盖文本与工具输入）
 	OutputDeltaCount int
+	AllToolInputs    []string
 	// 累计内容字符数，用于前200字符品牌名/模型名替换
 	ContentCharCount  int
 	PendingKiroBuffer string
@@ -107,10 +108,10 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 	case "assistantResponseEvent":
 		content, _ := payload["content"].(string)
 		if content != "" {
+			// 按原始内容累计 token（真实 tokenizer 统计）
+			h.OutputDeltaCount += tokenizer.CountTokens(content)
 			// 前200个字符内做品牌名和模型名替换
 			content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
-			// 每个 assistantResponseEvent 对应一个 token（参考 anthropic-tokenizer 项目）
-			h.OutputDeltaCount++
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
 			events = append(events, BuildOpenAIChunk(h.ID, h.Model, content, ""))
 		}
@@ -125,6 +126,8 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 		if toolCallID != "" && toolName != "" && h.CurrentToolCall == nil {
 			if !h.ProcessedToolUseIDs[toolCallID] {
 				h.ProcessedToolUseIDs[toolCallID] = true
+				// 工具名也算 output token
+				h.OutputDeltaCount += tokenizer.CountTokens(toolName)
 				h.CurrentToolCall = &ToolCallState{
 					ID:            toolCallID,
 					Name:          toolName,
@@ -162,6 +165,8 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 
 			if fragment != "" {
 				h.CurrentToolCall.ArgumentsJSON = append(h.CurrentToolCall.ArgumentsJSON, fragment)
+				h.AllToolInputs = append(h.AllToolInputs, fragment)
+				h.OutputDeltaCount += tokenizer.CountTokens(fragment)
 
 				// 发送增量参数
 				events = append(events, h.buildChunk(map[string]interface{}{
@@ -204,6 +209,10 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 
 					if toolCallID != "" && toolName != "" {
 						inputJSON, _ := json.Marshal(toolInput)
+
+						// codeReferenceEvent 一次性给出完整 tool_use，整块计入 output token
+						h.AllToolInputs = append(h.AllToolInputs, string(inputJSON))
+						h.OutputDeltaCount += tokenizer.CountTokens(toolName + string(inputJSON))
 
 						toolCall := map[string]interface{}{
 							"index": h.ToolCallIndex,
@@ -249,18 +258,21 @@ func (h *OpenAIStreamHandler) Finish() string {
 	return BuildOpenAIDone()
 }
 
-// OutputTokens 返回基于流式事件的输出 token 数（乘以2倍系数）
+// OutputTokens 返回基于流式事件的输出 token 数
+// 纯工具调用场景也能正确计数
 // @author ygw
 func (h *OpenAIStreamHandler) OutputTokens() int {
-	var tokens int
 	if h.OutputDeltaCount > 0 {
-		tokens = h.OutputDeltaCount
-	} else {
-		// 回退到文本估算（使用 tiktoken）
-		responseText := strings.Join(h.ResponseBuffer, "")
-		tokens = len(responseText) / 4 // 简单估算：4 字符约等于 1 token
+		return h.OutputDeltaCount
 	}
-	return tokens * 2
+	// 回退到完整文本估算（含工具输入）
+	fullText := strings.Join(h.ResponseBuffer, "")
+	fullToolInput := strings.Join(h.AllToolInputs, "")
+	tokens := tokenizer.CountTokens(fullText + fullToolInput)
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
 }
 
 // ResponseText 返回已累计的响应文本
