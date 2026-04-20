@@ -2153,7 +2153,9 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 
 		// 2. 工具数量超限：三级优先级（必留 > 普通核心 > MCP），按优先级从高到低填满 maxTools。
 		//    必留集合：Claude Code 早期稳定内置工具（文件/Shell/检索），永远最先保留。
-		const maxTools = 40
+		//    上限定为 80：AWS/Kiro/q-CLI 源码均未公开硬性工具数上限，真正约束是下方 100KB 体积上限；
+		//    80 足以覆盖 Claude Code（~16 essential）+ 常见 MCP 组合，仍保留硬兜底防异常客户端。
+		const maxTools = 80
 		if len(filteredTools) > maxTools {
 			var essential, coreOther, mcpTools []models.ClaudeTool
 			for _, t := range filteredTools {
