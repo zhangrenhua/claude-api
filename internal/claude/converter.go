@@ -77,6 +77,53 @@ func MapModelName(claudeModel string) string {
 	return defaultModel
 }
 
+// downstreamToUpstreamModel 下游请求模型名 → 上游期望模型名 的映射表
+// key 一律小写；查询时输入也会先小写化（见 MapDownstreamModel）
+var downstreamToUpstreamModel = map[string]string{
+	"claud 4.6":                  "claude-sonnet-4-5-20250929",
+	"claude opus 4.6":            "claude-sonnet-4-5-20250929",
+	"claude-2.0":                 "claude-2.0",
+	"claude-3-5-haiku-20241022":  "claude-3-5-haiku-20241022",
+	"claude-3-5-sonnet-20241022": "claude-haiku-4-5-20251001",
+	"claude-3-7-sonnet-20250219": "claude-haiku-4-5-20251001",
+	"claude-3-haiku-20240307":    "claude-3-haiku-20240307",
+	"claude-3-sonnet-20240229":   "claude-3-sonnet-20240229",
+	"claude-haiku-4-20250514":    "claude-haiku-4-20250514",
+	"claude-haiku-4-5-2025100":   "claude-haiku-4-5-2025100",
+	"claude-haiku-4-5-20251001":  "claude-haiku-4-5-20251001",
+	"claude-opus-4-20250514":     "claude-sonnet-4-20250514",
+	"claude-opus-4-5":            "claude-sonnet-4-5-20250929",
+	"claude-opus-4-5-20251101":   "claude-sonnet-4-5-20250929",
+	"claude-opus-4-6":            "claude-sonnet-4-5-20250929",
+	"claude-opus-4-6-20260130":   "claude-sonnet-4-5-20250929",
+	"claude-opus-4-6-thinking":   "claude-sonnet-4-5-20250929",
+	"claude-opus-4-7":            "claude-sonnet-4-5-20250929",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4-20250514",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4-5-20250929",
+	"claude-sonnet-4-6":          "claude-sonnet-4-5-20250929",
+	"claude-sonnet-4-6-20260217": "claude-sonnet-4-5-20250929",
+	"gpt-5":                      "claude-sonnet-4-20250514",
+	"gpt-5-codex":                "claude-sonnet-4-20250514",
+	"gpt-5-codex-mini":           "claude-sonnet-4-20250514",
+	"gpt-5.1":                    "claude-sonnet-4-20250514",
+	"gpt-5.1-codex":              "claude-sonnet-4-20250514",
+	"gpt-5.1-codex-max":          "claude-sonnet-4-20250514",
+	"gpt-5.1-codex-mini":         "claude-sonnet-4-20250514",
+	"gpt-5.2":                    "claude-sonnet-4-20250514",
+	"gpt-5.2-codex":              "claude-sonnet-4-20250514",
+	"gpt-5.3-codex":              "claude-sonnet-4-20250514",
+	"gpt-5.4":                    "claude-sonnet-4-5-20250929",
+	"gpt-5.4-mini":               "claude-sonnet-4-20250514",
+	"gpt-5.4-thinking":           "claude-sonnet-4-5-20250929",
+}
+
+// MapDownstreamModel 把下游请求模型名翻译为上游模型名
+// 大小写不敏感、忽略首尾空白；不在表中返回 ok=false
+func MapDownstreamModel(name string) (string, bool) {
+	v, ok := downstreamToUpstreamModel[strings.ToLower(strings.TrimSpace(name))]
+	return v, ok
+}
+
 // getCurrentTimestamp 获取当前时间戳
 func getCurrentTimestamp() string {
 	now := time.Now()

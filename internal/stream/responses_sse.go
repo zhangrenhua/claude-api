@@ -148,7 +148,7 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 		}
 
 		// 品牌名替换
-		content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
+		content, h.ContentCharCount, h.PendingKiroBuffer = replaceBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer, h.Model)
 
 		h.ResponseBuffer = append(h.ResponseBuffer, content)
 

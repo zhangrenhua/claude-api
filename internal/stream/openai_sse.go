@@ -111,7 +111,7 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 			// 按原始内容累计 token（真实 tokenizer 统计）
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
 			// 前200个字符内做品牌名和模型名替换
-			content, h.ContentCharCount, h.PendingKiroBuffer = replaceOpenAIBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
+			content, h.ContentCharCount, h.PendingKiroBuffer = replaceBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer, h.Model)
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
 			events = append(events, BuildOpenAIChunk(h.ID, h.Model, content, ""))
 		}

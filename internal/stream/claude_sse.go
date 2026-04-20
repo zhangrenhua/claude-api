@@ -14,16 +14,11 @@ const (
 	ThinkingEndTag   = "</thinking>"
 )
 
-// ReplaceBranding 对文本做品牌名和模型名替换（忽略大小写）
-// 1. Kiro → Claude
-// 2. 上游可能返回的模型名（如 "Claude Sonnet"、"Claude 3.5 Sonnet"、"claude-3-5-sonnet-20241022"）→ "Claude Opus"
-func ReplaceBranding(text string) string {
-	return replaceBrandingWith(text, "Claude", "Claude Opus 4")
-}
-
-// ReplaceOpenAIBranding 替换品牌名为 ChatGPT 5（用于 /v1/chat/completions 和 /v1/responses）
-func ReplaceOpenAIBranding(text string) string {
-	return replaceBrandingWith(text, "ChatGPT 5", "ChatGPT 5")
+// ReplaceBrandingWithModel 对文本做品牌名和模型名替换（忽略大小写）
+// 把 Kiro 与上游可能返回的 Claude 模型名一律替换为下游请求时传入的 modelName
+// 例如下游请求 "claude-opus-4-7"，则 "Kiro"/"Claude Sonnet 4.5" 都会被替换为 "claude-opus-4-7"
+func ReplaceBrandingWithModel(text, modelName string) string {
+	return replaceBrandingWith(text, modelName, modelName)
 }
 
 func replaceBrandingWith(text, kiroReplacement, modelReplacement string) string {
@@ -49,17 +44,14 @@ var (
 	modelIDPattern = regexp.MustCompile(`(?i)claude-(?:[\d.]+-)*(?:sonnet|opus|haiku)(?:-[\w.]+)*`)
 )
 
-// replaceKiroInContent 在前200个字符范围内做品牌名和模型名替换
+// replaceBrandInContent 在前200个字符范围内做品牌名和模型名替换
 // 智能检测尾部是否可能是品牌模式前缀，仅在必要时缓冲（而非固定窗口）
-// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的尾部
+// charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的尾部，modelName 是下游请求模型名
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
-func replaceKiroInContent(content string, charsSoFar int, pending string) (string, int, string) {
-	return replaceInContent(content, charsSoFar, pending, ReplaceBranding)
-}
-
-// replaceOpenAIBrandInContent 流式品牌替换（OpenAI/Responses 端点用 ChatGPT 5）
-func replaceOpenAIBrandInContent(content string, charsSoFar int, pending string) (string, int, string) {
-	return replaceInContent(content, charsSoFar, pending, ReplaceOpenAIBranding)
+func replaceBrandInContent(content string, charsSoFar int, pending string, modelName string) (string, int, string) {
+	return replaceInContent(content, charsSoFar, pending, func(s string) string {
+		return ReplaceBrandingWithModel(s, modelName)
+	})
 }
 
 func replaceInContent(content string, charsSoFar int, pending string, replacer func(string) string) (string, int, string) {
@@ -376,7 +368,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 		// 处理带有 thinking 标签检测的内容
 		if content != "" {
 			// 前200个字符内做品牌名和模型名替换
-			content, h.ContentCharCount, h.PendingKiroBuffer = replaceKiroInContent(content, h.ContentCharCount, h.PendingKiroBuffer)
+			content, h.ContentCharCount, h.PendingKiroBuffer = replaceBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer, h.Model)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
 			h.ThinkBuffer += content

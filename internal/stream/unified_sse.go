@@ -76,7 +76,7 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 		content, _ := payload["content"].(string)
 		if content != "" {
 			// 前200个字符内做品牌名和模型名替换
-			content, h.contentCharCount, h.pendingKiroBuffer = replaceKiroInContent(content, h.contentCharCount, h.pendingKiroBuffer)
+			content, h.contentCharCount, h.pendingKiroBuffer = replaceBrandInContent(content, h.contentCharCount, h.pendingKiroBuffer, h.Model)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.outputDeltaCount += tokenizer.CountTokens(content)
 			h.thinkingBuffer += content

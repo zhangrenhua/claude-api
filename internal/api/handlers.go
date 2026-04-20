@@ -2087,6 +2087,22 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		return
 	}
 
+	// 下游 → 上游模型名映射（白名单 + 翻译）
+	// 不在映射表内的模型名直接拒绝；命中后 req.Model 被替换为上游期望名以走后续 Amazon Q 流程
+	// originalDownstreamModel 全程保留下游原始名，用于响应回显与品牌替换
+	originalDownstreamModel := req.Model
+	mappedModel, mappedOK := claude.MapDownstreamModel(req.Model)
+	if !mappedOK {
+		logger.Warn("[模型映射] 不支持的模型名: %s - 来源: %s", req.Model, clientIP)
+		c.Set("error_message", "传入的模型名称有误")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "传入的模型名称有误"})
+		return
+	}
+	req.Model = mappedModel
+	if !strings.EqualFold(originalDownstreamModel, req.Model) {
+		c.Set("original_model", originalDownstreamModel)
+	}
+
 	// opus 模型桥接：如果模型名包含 opus，转发到 localhost:3003 服务（已禁用，直接在本服务处理）
 	// if strings.Contains(strings.ToLower(req.Model), "opus") {
 	// 	logger.Info("[Opus 桥接] 检测到 opus 模型: %s, 转发至 localhost:3003 - 来源: %s", req.Model, clientIP)
@@ -2238,7 +2254,8 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			originalModel = req.Model
 			req.Model = settings.ForceModel
 			logger.Info("[强制模型] 已替换模型: %s -> %s", originalModel, req.Model)
-			c.Set("original_model", originalModel)
+			// original_model 始终记录最初下游请求的模型名（覆盖映射阶段可能写入的同名值）
+			c.Set("original_model", originalDownstreamModel)
 		} else {
 			logger.Debug("[强制模型] haiku模型不替换: %s", req.Model)
 		}
@@ -2482,14 +2499,15 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 	if req.Stream {
 		// 控制台模式使用 UnifiedStreamHandler（前端期望的格式）
 		// 标准 Claude API 使用 ClaudeStreamHandler（标准 Claude SSE 格式）
+		// 传给响应处理函数的是下游原始模型名，作为 SSE 回显与品牌替换的目标值
 		isThinking := req.Thinking != nil
 		if isConsoleMode {
-			s.handleConsoleStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
+			s.handleConsoleStreamResponse(c, resp, originalDownstreamModel, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
 		} else {
-			s.handleClaudeStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
+			s.handleClaudeStreamResponse(c, resp, originalDownstreamModel, conversationID, clientIP, startTime, len(req.Messages), acc, inputTokens, isThinking, cacheInfo)
 		}
 	} else {
-		s.handleClaudeNonStreamResponse(c, resp, req.Model, conversationID, clientIP, startTime, acc, len(req.Messages), inputTokens, cacheInfo)
+		s.handleClaudeNonStreamResponse(c, resp, originalDownstreamModel, conversationID, clientIP, startTime, acc, len(req.Messages), inputTokens, cacheInfo)
 	}
 }
 
@@ -2745,12 +2763,13 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 	}
 
 	// 前250个字符内做品牌名和模型名替换（多取50字符余量，避免从模式中间截断）
+	// 用下游原始模型名作为替换目标
 	if len(fullContent) > 0 {
 		const brandLimit = 250
 		if len(fullContent) <= brandLimit {
-			fullContent = stream.ReplaceBranding(fullContent)
+			fullContent = stream.ReplaceBrandingWithModel(fullContent, model)
 		} else {
-			fullContent = stream.ReplaceBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+			fullContent = stream.ReplaceBrandingWithModel(fullContent[:brandLimit], model) + fullContent[brandLimit:]
 		}
 	}
 
@@ -2878,6 +2897,20 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// 下游 → 上游模型名映射（白名单 + 翻译）
+	originalDownstreamModel := req.Model
+	mappedModel, mappedOK := claude.MapDownstreamModel(req.Model)
+	if !mappedOK {
+		logger.Warn("[模型映射] 不支持的模型名: %s - 来源: %s", req.Model, clientIP)
+		c.Set("error_message", "传入的模型名称有误")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "传入的模型名称有误"})
+		return
+	}
+	req.Model = mappedModel
+	if !strings.EqualFold(originalDownstreamModel, req.Model) {
+		c.Set("original_model", originalDownstreamModel)
+	}
+
 	// 强制模型替换逻辑（haiku模型不替换）@author ygw
 	var originalModelOpenAI string
 	settingsOpenAI, _ := s.db.GetSettings(c.Request.Context())
@@ -2888,7 +2921,8 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 			originalModelOpenAI = req.Model
 			req.Model = settingsOpenAI.ForceModel
 			logger.Info("[强制模型] OpenAI格式已替换模型: %s -> %s", originalModelOpenAI, req.Model)
-			c.Set("original_model", originalModelOpenAI)
+			// original_model 始终记录最初下游请求的模型名
+			c.Set("original_model", originalDownstreamModel)
 		} else {
 			logger.Debug("[强制模型] OpenAI格式haiku模型不替换: %s", req.Model)
 		}
@@ -3058,9 +3092,9 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 
 openaiHandleResponse:
 	if req.Stream {
-		s.handleOpenAIStreamResponse(c, resp, req.Model, responseID, clientIP, startTime, len(req.Messages), account, inputTokens)
+		s.handleOpenAIStreamResponse(c, resp, originalDownstreamModel, responseID, clientIP, startTime, len(req.Messages), account, inputTokens)
 	} else {
-		s.handleOpenAINonStreamResponse(c, resp, req.Model, responseID, clientIP, startTime, account, len(req.Messages), inputTokens)
+		s.handleOpenAINonStreamResponse(c, resp, originalDownstreamModel, responseID, clientIP, startTime, account, len(req.Messages), inputTokens)
 	}
 }
 
@@ -3195,12 +3229,13 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 	}
 
 	// 前250个字符内做品牌名和模型名替换（多取50字符余量，避免从模式中间截断）
+	// 用下游原始模型名作为替换目标
 	if len(fullContent) > 0 {
 		const brandLimit = 250
 		if len(fullContent) <= brandLimit {
-			fullContent = stream.ReplaceOpenAIBranding(fullContent)
+			fullContent = stream.ReplaceBrandingWithModel(fullContent, model)
 		} else {
-			fullContent = stream.ReplaceOpenAIBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+			fullContent = stream.ReplaceBrandingWithModel(fullContent[:brandLimit], model) + fullContent[brandLimit:]
 		}
 	}
 
@@ -3295,6 +3330,20 @@ func (s *Server) handleResponses(c *gin.Context) {
 		return
 	}
 
+	// 下游 → 上游模型名映射（白名单 + 翻译）
+	originalDownstreamModel := req.Model
+	mappedModel, mappedOK := claude.MapDownstreamModel(req.Model)
+	if !mappedOK {
+		logger.Warn("[模型映射] 不支持的模型名: %s - 来源: %s", req.Model, clientIP)
+		c.Set("error_message", "传入的模型名称有误")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "传入的模型名称有误"})
+		return
+	}
+	req.Model = mappedModel
+	if !strings.EqualFold(originalDownstreamModel, req.Model) {
+		c.Set("original_model", originalDownstreamModel)
+	}
+
 	// 将 Responses API input 转换为 ChatMessage 数组
 	messages, err := convertResponsesInputToMessages(req.Input, req.Instructions)
 	if err != nil {
@@ -3322,7 +3371,8 @@ func (s *Server) handleResponses(c *gin.Context) {
 			originalModel := chatReq.Model
 			chatReq.Model = settings.ForceModel
 			logger.Info("[强制模型] Responses格式已替换模型: %s -> %s", originalModel, chatReq.Model)
-			c.Set("original_model", originalModel)
+			// original_model 始终记录最初下游请求的模型名
+			c.Set("original_model", originalDownstreamModel)
 		}
 	}
 
@@ -3485,9 +3535,9 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 responsesHandleResponse:
 	if chatReq.Stream {
-		s.handleResponsesStreamResponse(c, resp, chatReq.Model, responseID, clientIP, startTime, len(chatReq.Messages), account, inputTokens)
+		s.handleResponsesStreamResponse(c, resp, originalDownstreamModel, responseID, clientIP, startTime, len(chatReq.Messages), account, inputTokens)
 	} else {
-		s.handleResponsesNonStreamResponse(c, resp, chatReq.Model, responseID, clientIP, startTime, account, len(chatReq.Messages), inputTokens)
+		s.handleResponsesNonStreamResponse(c, resp, originalDownstreamModel, responseID, clientIP, startTime, account, len(chatReq.Messages), inputTokens)
 	}
 }
 
@@ -3621,13 +3671,13 @@ func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Res
 	fullContent = strings.ReplaceAll(fullContent, "你的知识库截止日期是 2026 年 1 月。", "")
 	fullContent = strings.TrimSpace(fullContent)
 
-	// 品牌名替换
+	// 品牌名替换：使用下游请求的模型名（model 参数）作为替换目标
 	if len(fullContent) > 0 {
 		const brandLimit = 250
 		if len(fullContent) <= brandLimit {
-			fullContent = stream.ReplaceOpenAIBranding(fullContent)
+			fullContent = stream.ReplaceBrandingWithModel(fullContent, model)
 		} else {
-			fullContent = stream.ReplaceOpenAIBranding(fullContent[:brandLimit]) + fullContent[brandLimit:]
+			fullContent = stream.ReplaceBrandingWithModel(fullContent[:brandLimit], model) + fullContent[brandLimit:]
 		}
 	}
 

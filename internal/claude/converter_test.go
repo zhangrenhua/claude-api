@@ -1332,6 +1332,49 @@ func TestConvertClaudeToAmazonQ_InputSchemaMissingType(t *testing.T) {
 	}
 }
 
+// TestMapDownstreamModel 验证下游→上游模型名映射表
+func TestMapDownstreamModel(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		want     string
+		wantOK   bool
+	}{
+		// 表内键
+		{"opus-4-7 → sonnet-4-5", "claude-opus-4-7", "claude-sonnet-4-5-20250929", true},
+		{"opus-4-6 → sonnet-4-5", "claude-opus-4-6", "claude-sonnet-4-5-20250929", true},
+		{"sonnet-4-5 自映射", "claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929", true},
+		{"haiku-4-5 自映射", "claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001", true},
+		{"gpt-5-codex → sonnet-4", "gpt-5-codex", "claude-sonnet-4-20250514", true},
+		{"gpt-5.4-thinking → sonnet-4-5", "gpt-5.4-thinking", "claude-sonnet-4-5-20250929", true},
+		// 大小写不敏感
+		{"大写 OPUS-4-7", "CLAUDE-OPUS-4-7", "claude-sonnet-4-5-20250929", true},
+		{"混合 GPT-5.2-Codex", "GPT-5.2-Codex", "claude-sonnet-4-20250514", true},
+		// 空格修剪
+		{"前后空格", "  claude-opus-4-7  ", "claude-sonnet-4-5-20250929", true},
+		// 含空格的旧键
+		{"Claud 4.6 (空格)", "Claud 4.6", "claude-sonnet-4-5-20250929", true},
+		{"Claude Opus 4.6 (空格)", "Claude Opus 4.6", "claude-sonnet-4-5-20250929", true},
+		// 表外应返回 false
+		{"未知模型 foo-bar", "foo-bar", "", false},
+		{"未知 gpt-99", "gpt-99", "", false},
+		{"空字符串", "", "", false},
+		{"纯空格", "   ", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := MapDownstreamModel(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("MapDownstreamModel(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("MapDownstreamModel(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestConvertClaudeToAmazonQ_SanitizesBadToolIDsEndToEnd 端到端验证：
 // 客户端请求里含 `Bash:19` 风格 ID，经转换后上游 payload 全部为合法 ID
 func TestConvertClaudeToAmazonQ_SanitizesBadToolIDsEndToEnd(t *testing.T) {
