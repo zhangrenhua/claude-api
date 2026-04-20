@@ -5,6 +5,7 @@ import (
 	"claude-api/internal/models"
 	"claude-api/internal/utils"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -269,6 +270,25 @@ func generateToolUseID() string {
 		return fmt.Sprintf("toolu_%d", time.Now().UnixNano())
 	}
 	return "toolu_" + hex.EncodeToString(b[:])
+}
+
+// MaxToolNameLen 是 Anthropic / Amazon Q 接受的工具名最大长度。
+// 来自 Anthropic 官方约束 ^[a-zA-Z0-9_-]{1,64}$，Amazon Q 同样按此校验，
+// 超长会返回 ValidationException("Improperly formed request")。
+const MaxToolNameLen = 64
+
+// sanitizeToolName 将超长工具名截断到 64 字符以内，使用 SHA-1 前 8 位十六进制作为后缀，
+// 保证同一原名经过本函数始终映射为同一短名（确定性，无需共享 map），
+// 这样 tools[] 与历史中 toolUses[].name 即便分别处理也保持一致。
+// 长度 ≤ MaxToolNameLen 的名称原样返回。
+func sanitizeToolName(name string) string {
+	if len(name) <= MaxToolNameLen {
+		return name
+	}
+	sum := sha1.Sum([]byte(name))
+	suffix := hex.EncodeToString(sum[:4]) // 8 hex 字符
+	// 保留前 (MaxToolNameLen - 1 - len(suffix)) = 55 字符 + "_" + 8 字符 = 64
+	return name[:MaxToolNameLen-1-len(suffix)] + "_" + suffix
 }
 
 // sanitizeToolUseIDs 扫描所有消息，将不合法的 tool_use.id 替换为合法 ID，
@@ -641,9 +661,16 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 			logger.Debug("[消息转换] 工具 %s 的 input_schema 缺少 type，补齐为 object", t.Name)
 		}
 
+		// 工具名长度规整：>64 字符的名称会被上游拒绝（ValidationException），
+		// 需要确定性截断，使 history 中 toolUses[].name 经过同一函数后仍能匹配。
+		aqName := sanitizeToolName(t.Name)
+		if aqName != t.Name {
+			logger.Debug("[消息转换] 工具名超长已截断: %s -> %s", t.Name, aqName)
+		}
+
 		aqTools = append(aqTools, models.Tool{
 			ToolSpecification: models.ToolSpecification{
-				Name:        t.Name,
+				Name:        aqName,
 				Description: desc,
 				InputSchema: models.ToolInputSchema{
 					JSON: inputSchema,
@@ -1301,6 +1328,8 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 
 					name, _ := m["name"].(string)
 					input, _ := m["input"].(map[string]interface{})
+					// 与 tools[] 一致地规整：超长名截断到 64 字符以内，否则上游拒绝。
+					name = sanitizeToolName(name)
 					toolUseIdToName[tid] = name
 
 					toolUses = append(toolUses, models.ToolUse{

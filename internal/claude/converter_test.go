@@ -1440,3 +1440,158 @@ func TestConvertClaudeToAmazonQ_SanitizesBadToolIDsEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestSanitizeToolName 验证工具名长度规整：
+//   - ≤64 字符原样返回
+//   - >64 字符截断到 64 字符（前 55 + "_" + 8 位十六进制 hash）
+//   - 函数确定性：同名永远映射到同一短名
+//   - 不同长名互相不冲突（前缀相同时由 hash 区分）
+func TestSanitizeToolName(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantLen   int
+		wantEqual bool // 是否应与 input 相等
+	}{
+		{"short name unchanged", "Bash", 4, true},
+		{"exactly 64 unchanged", strings.Repeat("a", 64), 64, true},
+		{"65 truncated", strings.Repeat("a", 65), 64, false},
+		{"long mcp name truncated",
+			"mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight",
+			64, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeToolName(tt.input)
+			if len(got) != tt.wantLen {
+				t.Errorf("sanitizeToolName(%q) len=%d, want %d (got=%q)",
+					tt.input, len(got), tt.wantLen, got)
+			}
+			if tt.wantEqual && got != tt.input {
+				t.Errorf("sanitizeToolName(%q) = %q, want unchanged", tt.input, got)
+			}
+			if !tt.wantEqual && got == tt.input {
+				t.Errorf("sanitizeToolName(%q) was not truncated", tt.input)
+			}
+		})
+	}
+}
+
+func TestSanitizeToolName_Deterministic(t *testing.T) {
+	name := "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight"
+	a := sanitizeToolName(name)
+	b := sanitizeToolName(name)
+	if a != b {
+		t.Errorf("non-deterministic: %q vs %q", a, b)
+	}
+}
+
+func TestSanitizeToolName_DistinguishesSamePrefix(t *testing.T) {
+	// 两个超长且共享前 55 字符的名字必须映射到不同短名（hash 后缀区分）
+	prefix := strings.Repeat("x", 55)
+	a := sanitizeToolName(prefix + "_aaaaaaaaa_one_distinguisher_suffix")
+	b := sanitizeToolName(prefix + "_bbbbbbbbb_two_distinguisher_suffix")
+	if a == b {
+		t.Errorf("expected different sanitized names for distinct long inputs sharing prefix; both = %q", a)
+	}
+	if len(a) != 64 || len(b) != 64 {
+		t.Errorf("expected length 64, got %d / %d", len(a), len(b))
+	}
+}
+
+// TestConvertClaudeToAmazonQ_LongToolNameTruncated 端到端：
+// 当工具定义和历史消息都引用了一个 >64 字符的工具名时，
+// 上游 payload 中工具列表与 history.toolUses[].name 都应被截断到 ≤64 字符，
+// 且两处映射结果一致（确保上游能匹配到对应工具定义）。
+func TestConvertClaudeToAmazonQ_LongToolNameTruncated(t *testing.T) {
+	longName := "mcp__plugin_chrome-devtools-mcp_chrome-devtools__performance_analyze_insight"
+	if len(longName) <= 64 {
+		t.Fatalf("test fixture must be >64 chars, got %d", len(longName))
+	}
+
+	req := &models.ClaudeRequest{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+		Messages: []models.ClaudeMessage{
+			{Role: "user", Content: "trace this page"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{
+					"type":  "tool_use",
+					"id":    "toolu_abc123def456",
+					"name":  longName,
+					"input": map[string]interface{}{"url": "https://example.com"},
+				},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_abc123def456",
+					"content":     "trace done",
+				},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "done"},
+			}},
+			{Role: "user", Content: "thanks"},
+		},
+		Tools: []models.ClaudeTool{
+			{
+				Name:        longName,
+				Description: "run a perf trace",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+	}
+
+	result, err := ConvertClaudeToAmazonQ(req, "", false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+
+	expected := sanitizeToolName(longName)
+	if len(expected) != 64 {
+		t.Fatalf("expected sanitized length 64, got %d (%q)", len(expected), expected)
+	}
+
+	// tools[] 应使用截断后的名字
+	tools := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool in payload, got %d", len(tools))
+	}
+	if tools[0].ToolSpecification.Name != expected {
+		t.Errorf("tool spec name = %q, want %q", tools[0].ToolSpecification.Name, expected)
+	}
+	if len(tools[0].ToolSpecification.Name) > 64 {
+		t.Errorf("tool spec name length %d exceeds 64", len(tools[0].ToolSpecification.Name))
+	}
+
+	// history 中 assistantResponseMessage.toolUses[].name 也应被同步截断
+	var foundToolUse bool
+	for i, h := range result.ConversationState.History {
+		if h.AssistantResponseMessage == nil {
+			continue
+		}
+		for _, tu := range h.AssistantResponseMessage.ToolUses {
+			foundToolUse = true
+			if tu.Name != expected {
+				t.Errorf("history[%d] toolUse.Name = %q, want %q (must match tool spec name)",
+					i, tu.Name, expected)
+			}
+			if len(tu.Name) > 64 {
+				t.Errorf("history[%d] toolUse.Name length %d exceeds 64", i, len(tu.Name))
+			}
+		}
+	}
+	if !foundToolUse {
+		t.Fatal("expected at least one toolUse in history")
+	}
+
+	// 整个 payload 不应再含原始 76 字符的名字
+	data, _ := json.Marshal(result)
+	if strings.Contains(string(data), longName) {
+		t.Errorf("payload should not contain original long name %q:\n%s", longName, string(data))
+	}
+}
