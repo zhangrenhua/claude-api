@@ -113,6 +113,7 @@ var downstreamToUpstreamModel = map[string]string{
 	"gpt-5.2":                    "claude-sonnet-4-20250514",
 	"gpt-5.2-codex":              "claude-sonnet-4-20250514",
 	"gpt-5.3-codex":              "claude-sonnet-4-20250514",
+	"gpt-5.3-codex-spark":        "claude-sonnet-4-20250514",
 	"gpt-5.4":                    "claude-sonnet-4-5-20250929",
 	"gpt-5.4-mini":               "claude-sonnet-4-20250514",
 	"gpt-5.4-thinking":           "claude-sonnet-4-5-20250929",
