@@ -1595,3 +1595,206 @@ func TestConvertClaudeToAmazonQ_LongToolNameTruncated(t *testing.T) {
 		t.Errorf("payload should not contain original long name %q:\n%s", longName, string(data))
 	}
 }
+
+// TestSanitizeJSONSchema_StripsUnsupportedKeywords 验证上游不接受的 JSON Schema 关键字被剥离：
+// anyOf / oneOf / allOf / $ref / $defs / propertyNames / patternProperties / if / then / else。
+func TestSanitizeJSONSchema_StripsUnsupportedKeywords(t *testing.T) {
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"nested": map[string]interface{}{
+				"$ref": "#/$defs/Foo",
+			},
+			"metadata": map[string]interface{}{
+				"type":          "object",
+				"propertyNames": map[string]interface{}{"type": "string"},
+				"patternProperties": map[string]interface{}{
+					"^x_": map[string]interface{}{"type": "string"},
+				},
+			},
+			"mixed": map[string]interface{}{
+				"allOf": []interface{}{
+					map[string]interface{}{"type": "string"},
+					map[string]interface{}{"minLength": 1},
+				},
+				"not": map[string]interface{}{"type": "null"},
+			},
+			"branching": map[string]interface{}{
+				"if":   map[string]interface{}{"type": "string"},
+				"then": map[string]interface{}{"minLength": 1},
+				"else": map[string]interface{}{"type": "integer"},
+			},
+		},
+		"$defs": map[string]interface{}{
+			"Foo": map[string]interface{}{"type": "string"},
+		},
+	}
+	out := sanitizeJSONSchema(schema)
+	data, _ := json.Marshal(out)
+	raw := string(data)
+
+	for _, forbidden := range []string{
+		`"$ref"`, `"$defs"`, `"propertyNames"`, `"patternProperties"`,
+		`"allOf"`, `"not"`, `"if"`, `"then"`, `"else"`,
+	} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("sanitized schema must not contain %s, got: %s", forbidden, raw)
+		}
+	}
+	// properties 结构应保留
+	props, ok := out["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("properties missing after sanitize: %v", out)
+	}
+	for _, key := range []string{"nested", "metadata", "mixed", "branching"} {
+		if _, ok := props[key]; !ok {
+			t.Errorf("property %q dropped after sanitize", key)
+		}
+	}
+}
+
+// TestSanitizeJSONSchema_CollapsesUnionEnum 验证 TypeScript 风格的 union type
+// (anyOf 多个 {type:string, enum/const}) 被合并为单个 enum，保留全部候选值。
+// 原始复现：TaskUpdate.status 用 anyOf 拼接基础枚举 + 额外 "deleted" const，
+// CodeWhisperer 不接受 anyOf 导致 Improperly formed request。
+func TestSanitizeJSONSchema_CollapsesUnionEnum(t *testing.T) {
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"status": map[string]interface{}{
+				"description": "New status for the task",
+				"anyOf": []interface{}{
+					map[string]interface{}{
+						"type": "string",
+						"enum": []interface{}{"pending", "in_progress", "completed"},
+					},
+					map[string]interface{}{
+						"type":  "string",
+						"const": "deleted",
+					},
+				},
+			},
+		},
+	}
+	out := sanitizeJSONSchema(schema)
+	props := out["properties"].(map[string]interface{})
+	status := props["status"].(map[string]interface{})
+
+	if _, ok := status["anyOf"]; ok {
+		t.Fatalf("anyOf should be collapsed away, got: %v", status)
+	}
+	if got, _ := status["type"].(string); got != "string" {
+		t.Errorf("type should be 'string', got %v", status["type"])
+	}
+	enum, ok := status["enum"].([]interface{})
+	if !ok {
+		t.Fatalf("enum should be present, got: %v", status)
+	}
+	want := map[string]bool{"pending": true, "in_progress": true, "completed": true, "deleted": true}
+	if len(enum) != len(want) {
+		t.Fatalf("enum should have %d values, got %d: %v", len(want), len(enum), enum)
+	}
+	for _, v := range enum {
+		s, _ := v.(string)
+		if !want[s] {
+			t.Errorf("unexpected enum value %q", s)
+		}
+	}
+}
+
+// TestSanitizeJSONSchema_ConvertsConstToEnum 验证 property-level const 被转为单值 enum，
+// 保留约束语义的同时避免使用上游不支持的 const 关键字。
+func TestSanitizeJSONSchema_ConvertsConstToEnum(t *testing.T) {
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"mode": map[string]interface{}{
+				"type":  "string",
+				"const": "fixed",
+			},
+		},
+	}
+	out := sanitizeJSONSchema(schema)
+	props := out["properties"].(map[string]interface{})
+	mode := props["mode"].(map[string]interface{})
+	if _, ok := mode["const"]; ok {
+		t.Fatalf("const should be removed, got: %v", mode)
+	}
+	enum, ok := mode["enum"].([]interface{})
+	if !ok || len(enum) != 1 || enum[0] != "fixed" {
+		t.Errorf("const should be converted to enum:[\"fixed\"], got: %v", mode["enum"])
+	}
+}
+
+// TestFixOrphanToolResults_DropsReusedID 验证已被配对消费的 tool_use_id 若在后续 user 消息中
+// 再次出现 tool_result，会被判为重放/重复并移除；这是 File 1 (43.130.111.176) 的复现场景：
+//
+//	[asst tool_use tool_1] → [user tool_result tool_1] ✓
+//	[asst 文本] → [user tool_result tool_1]  ← 重放，应被丢弃
+func TestFixOrphanToolResults_DropsReusedID(t *testing.T) {
+	msgs := []models.ClaudeMessage{
+		{Role: "user", Content: "start"},
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{"type": "tool_use", "id": "tool_1", "name": "Write", "input": map[string]interface{}{}},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"},
+		}},
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{"type": "text", "text": "done"},
+		}},
+		// 重放：与上条 tool_use 无关，应被剔除
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_1", "content": "replay"},
+		}},
+	}
+
+	out := fixOrphanToolResults(msgs)
+
+	// 5 -> 4（最后一条被清空并跳过）
+	if len(out) != 4 {
+		t.Fatalf("expected 4 messages after drop, got %d", len(out))
+	}
+	for i, m := range out {
+		if blocks, ok := m.Content.([]interface{}); ok {
+			for _, b := range blocks {
+				if mm, ok := b.(map[string]interface{}); ok && mm["type"] == "tool_result" {
+					if mm["tool_use_id"] == "tool_1" && mm["content"] == "replay" {
+						t.Errorf("replay tool_result should be removed, found in out[%d]", i)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestFixOrphanToolResults_KeepsValidAndDropsPureOrphan 验证保留正常配对，同时丢弃从未声明过的纯孤儿。
+func TestFixOrphanToolResults_KeepsValidAndDropsPureOrphan(t *testing.T) {
+	msgs := []models.ClaudeMessage{
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{"type": "tool_use", "id": "A", "name": "Read", "input": map[string]interface{}{}},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "A", "content": "ok"},
+			// 从未声明过的 "ghost"，应被移除
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "ghost", "content": "bad"},
+			map[string]interface{}{"type": "text", "text": "continue"},
+		}},
+	}
+
+	out := fixOrphanToolResults(msgs)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(out))
+	}
+	blocks, _ := out[1].Content.([]interface{})
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks in user msg (tool_result A + text), got %d: %v", len(blocks), blocks)
+	}
+	for _, b := range blocks {
+		if m, ok := b.(map[string]interface{}); ok {
+			if m["type"] == "tool_result" && m["tool_use_id"] == "ghost" {
+				t.Errorf("pure-orphan tool_result should be removed")
+			}
+		}
+	}
+}

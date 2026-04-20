@@ -365,51 +365,60 @@ func sanitizeToolUseIDs(messages []models.ClaudeMessage) {
 // fixOrphanToolResults 清理孤立的 tool_result
 // 当 user 消息中包含 tool_result 但前面没有 assistant 消息包含对应的 tool_use 时，
 // 直接移除这些孤立的 tool_result，避免上游拒绝请求
+// fixOrphanToolResults 顺序扫描消息，维护"尚未被 tool_result 消费的 tool_use id"集合，
+// 移除两类非法 tool_result：
+//  1. 从未声明过（availableToolUseIDs 中不存在）——纯孤儿；
+//  2. 已被更早的 tool_result 消费过（重复/重放）——CodeWhisperer 也会判为非法。
+//
+// 客户端（尤其是某些 IDE 插件）可能在重试/状态回放时把已配对过的 tool_result 再发一次，
+// 旧实现只按"是否声明过"判定会漏掉这种情况。
 func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessage {
 	if len(messages) == 0 {
 		return messages
 	}
 
-	// 收集所有 assistant 消息中的 tool_use id
-	availableToolUseIDs := make(map[string]bool)
+	pending := make(map[string]bool) // 待消费的 tool_use id
+	removed := 0
+	modified := false
+	result := make([]models.ClaudeMessage, 0, len(messages))
+
 	for _, msg := range messages {
 		if msg.Role == "assistant" {
 			if blocks, ok := msg.Content.([]interface{}); ok {
 				for _, block := range blocks {
 					if m, ok := block.(map[string]interface{}); ok && m["type"] == "tool_use" {
-						if id, ok := m["id"].(string); ok {
-							availableToolUseIDs[id] = true
+						if id, ok := m["id"].(string); ok && id != "" {
+							pending[id] = true
 						}
 					}
 				}
 			}
+			result = append(result, msg)
+			continue
 		}
-	}
 
-	// 遍历 user 消息，移除孤立的 tool_result
-	modified := false
-	result := make([]models.ClaudeMessage, 0, len(messages))
-	for _, msg := range messages {
 		if msg.Role == "user" {
 			if blocks, ok := msg.Content.([]interface{}); ok {
-				var cleaned []interface{}
-				removedCount := 0
+				cleaned := make([]interface{}, 0, len(blocks))
+				localRemoved := 0
 				for _, block := range blocks {
 					if m, ok := block.(map[string]interface{}); ok && m["type"] == "tool_result" {
 						if toolUseID, ok := m["tool_use_id"].(string); ok && toolUseID != "" {
-							if !availableToolUseIDs[toolUseID] {
-								removedCount++
-								continue // 跳过孤立的 tool_result
+							if pending[toolUseID] {
+								delete(pending, toolUseID) // 本次消费
+							} else {
+								localRemoved++
+								continue
 							}
 						}
 					}
 					cleaned = append(cleaned, block)
 				}
-				if removedCount > 0 {
+				if localRemoved > 0 {
 					modified = true
-					logger.Info("[消息修复] 移除 %d 个孤立的 tool_result (无对应 tool_use)", removedCount)
+					removed += localRemoved
 					if len(cleaned) == 0 {
-						// 整条 user 消息的内容全部被移除，跳过该消息
+						// 整条 user 消息已清空，跳过该消息
 						continue
 					}
 					msg.Content = interface{}(cleaned)
@@ -419,6 +428,9 @@ func fixOrphanToolResults(messages []models.ClaudeMessage) []models.ClaudeMessag
 		result = append(result, msg)
 	}
 
+	if removed > 0 {
+		logger.Info("[消息修复] 移除 %d 个非法 tool_result（孤儿或已被消费）", removed)
+	}
 	if !modified {
 		return messages
 	}
@@ -948,9 +960,98 @@ func mergeToolResultIntoMap(resultsByID map[string]*models.ToolResult, order *[]
 // - 移除空的 required 数组
 // - 移除值为 null 的字段
 // - 递归处理 properties、anyOf、oneOf 等嵌套结构
+// unsupportedSchemaKeywords 列出 Amazon Q / CodeWhisperer 工具 schema 验证器不接受的 JSON Schema 关键字。
+// 命中的键会在 sanitizeJSONSchema 中被剥离；命中 anyOf/oneOf 的字符串枚举联合会先尝试合并为单 enum。
+var unsupportedSchemaKeywords = map[string]bool{
+	"additionalProperties":  true,
+	"$schema":               true,
+	"$id":                   true,
+	"$ref":                  true,
+	"$defs":                 true,
+	"definitions":           true,
+	"anyOf":                 true,
+	"oneOf":                 true,
+	"allOf":                 true,
+	"not":                   true,
+	"propertyNames":         true,
+	"patternProperties":     true,
+	"dependencies":          true,
+	"dependentRequired":     true,
+	"dependentSchemas":      true,
+	"if":                    true,
+	"then":                  true,
+	"else":                  true,
+	"contains":              true,
+	"minContains":           true,
+	"maxContains":           true,
+	"unevaluatedProperties": true,
+	"unevaluatedItems":      true,
+}
+
+// tryCollapseUnionEnums 尝试把形如 anyOf/oneOf 的 string-枚举联合合并为单个 enum。
+// 典型场景：TypeScript 风格的 union type（例如 "pending" | "in_progress" | "deleted"），
+// 上游不接受 anyOf，但等价于一个合并的 enum。
+// 仅当所有分支都是相同 type 的 scalar，且通过 enum 或 const 约束值时才合并，否则返回 nil（由上层剥离关键字）。
+func tryCollapseUnionEnums(schema map[string]interface{}) map[string]interface{} {
+	var branches []interface{}
+	var unionKey string
+	for _, k := range []string{"anyOf", "oneOf"} {
+		if arr, ok := schema[k].([]interface{}); ok && len(arr) > 0 {
+			branches = arr
+			unionKey = k
+			break
+		}
+	}
+	if branches == nil {
+		return nil
+	}
+	var merged []interface{}
+	commonType := ""
+	for _, b := range branches {
+		m, ok := b.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		t, _ := m["type"].(string)
+		if t == "" {
+			return nil
+		}
+		if commonType == "" {
+			commonType = t
+		} else if commonType != t {
+			return nil
+		}
+		if en, ok := m["enum"].([]interface{}); ok {
+			merged = append(merged, en...)
+		} else if c, ok := m["const"]; ok {
+			merged = append(merged, c)
+		} else {
+			return nil
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(schema))
+	for k, v := range schema {
+		if k == unionKey {
+			continue
+		}
+		out[k] = v
+	}
+	out["type"] = commonType
+	out["enum"] = merged
+	return out
+}
+
 func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
 	if len(schema) == 0 {
 		return schema
+	}
+
+	// 优先尝试把 anyOf/oneOf 的 string 枚举联合合并为单个 enum，保留语义
+	if collapsed := tryCollapseUnionEnums(schema); collapsed != nil {
+		schema = collapsed
 	}
 
 	result := make(map[string]interface{}, len(schema))
@@ -959,12 +1060,13 @@ func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
 		if val == nil {
 			continue
 		}
-		// 移除 additionalProperties（Amazon Q 不支持）
-		if key == "additionalProperties" {
+		// 跳过所有上游不支持的关键字（含 anyOf/oneOf/allOf/$ref/$defs/propertyNames 等）
+		if unsupportedSchemaKeywords[key] {
 			continue
 		}
-		// 移除 $schema 元属性（Amazon Q 工具 schema 不接受 JSON Schema 元数据）
-		if key == "$schema" {
+		// const 转 enum，保留约束语义
+		if key == "const" {
+			result["enum"] = []interface{}{val}
 			continue
 		}
 		// 移除空的 required 数组
@@ -996,7 +1098,7 @@ func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
 			continue
 		}
 
-		// 递归处理数组元素（如 anyOf、oneOf）
+		// 递归处理数组元素（items 可能是 []schema 形式）
 		if arr, ok := val.([]interface{}); ok {
 			cleanedArr := make([]interface{}, 0, len(arr))
 			for _, item := range arr {

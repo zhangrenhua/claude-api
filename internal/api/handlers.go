@@ -28,6 +28,27 @@ import (
 	"github.com/google/uuid"
 )
 
+// claudeEssentialToolNames 是 Claude Code 的"必留"工具白名单：文件/Shell/检索等早期稳定内置工具。
+// 工具截断按 essential > 普通核心 > MCP 三级优先级保留；该集合内的工具最先被保留、最后被丢弃。
+var claudeEssentialToolNames = map[string]bool{
+	"Bash":         true,
+	"BashOutput":   true,
+	"KillShell":    true,
+	"Read":         true,
+	"Edit":         true,
+	"MultiEdit":    true,
+	"Write":        true,
+	"Grep":         true,
+	"Glob":         true,
+	"LS":           true,
+	"NotebookEdit": true,
+	"NotebookRead": true,
+	"Task":         true,
+	"TodoWrite":    true,
+	"WebFetch":     true,
+	"WebSearch":    true,
+}
+
 // checkAccountSuspended 检查账号是否被封控（带缓存）
 // 返回 true 表示账号被封控
 // @author ygw
@@ -2130,27 +2151,48 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			filteredTools = append(filteredTools, t)
 		}
 
-		// 2. 工具数量超限：优先保留核心工具，裁剪 MCP 工具
+		// 2. 工具数量超限：三级优先级（必留 > 普通核心 > MCP），按优先级从高到低填满 maxTools。
+		//    必留集合：Claude Code 早期稳定内置工具（文件/Shell/检索），永远最先保留。
 		const maxTools = 40
 		if len(filteredTools) > maxTools {
-			var coreTools, mcpTools []models.ClaudeTool
+			var essential, coreOther, mcpTools []models.ClaudeTool
 			for _, t := range filteredTools {
 				if strings.HasPrefix(t.Name, "mcp__") || strings.HasPrefix(t.Name, "mcp_") {
 					mcpTools = append(mcpTools, t)
+				} else if claudeEssentialToolNames[t.Name] {
+					essential = append(essential, t)
 				} else {
-					coreTools = append(coreTools, t)
+					coreOther = append(coreOther, t)
 				}
 			}
 
-			if len(coreTools) >= maxTools {
-				filteredTools = coreTools[:maxTools]
-				logger.Info("[工具预处理] 核心工具超限，截断为 %d 个，丢弃 %d 个核心工具和 %d 个 MCP 工具",
-					maxTools, len(coreTools)-maxTools, len(mcpTools))
+			// 按 essential → coreOther → mcp 顺序拼接后截断到 maxTools
+			ordered := make([]models.ClaudeTool, 0, len(essential)+len(coreOther)+len(mcpTools))
+			ordered = append(ordered, essential...)
+			ordered = append(ordered, coreOther...)
+			ordered = append(ordered, mcpTools...)
+
+			if len(ordered) > maxTools {
+				dropped := len(ordered) - maxTools
+				filteredTools = ordered[:maxTools]
+				// 统计各级被丢弃的数量（从尾部丢弃，因此 MCP 最先被丢）
+				droppedMCP := min(dropped, len(mcpTools))
+				droppedCoreOther := 0
+				droppedEssential := 0
+				rem := dropped - droppedMCP
+				if rem > 0 {
+					droppedCoreOther = min(rem, len(coreOther))
+					rem -= droppedCoreOther
+				}
+				if rem > 0 {
+					droppedEssential = rem
+				}
+				logger.Info("[工具预处理] 工具数超限（%d > %d），保留 essential=%d core=%d mcp=%d；丢弃 essential=%d core=%d mcp=%d",
+					len(filteredTools)+dropped, maxTools,
+					len(essential)-droppedEssential, len(coreOther)-droppedCoreOther, len(mcpTools)-droppedMCP,
+					droppedEssential, droppedCoreOther, droppedMCP)
 			} else {
-				remaining := maxTools - len(coreTools)
-				filteredTools = append(coreTools, mcpTools[:remaining]...)
-				logger.Info("[工具预处理] 保留 %d 个核心工具 + %d 个 MCP 工具（丢弃 %d 个 MCP 工具）",
-					len(coreTools), remaining, len(mcpTools)-remaining)
+				filteredTools = ordered
 			}
 		}
 
