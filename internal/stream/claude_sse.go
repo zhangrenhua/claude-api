@@ -26,6 +26,8 @@ func replaceBrandingWith(text, kiroReplacement, modelReplacement string) string 
 	text = modelWithParenPattern.ReplaceAllString(text, modelReplacement)
 	text = modelFriendlyPattern.ReplaceAllString(text, modelReplacement)
 	text = modelIDPattern.ReplaceAllString(text, modelReplacement)
+	text = chatgptPattern.ReplaceAllString(text, modelReplacement)
+	text = gptIDPattern.ReplaceAllString(text, modelReplacement)
 	return text
 }
 
@@ -42,6 +44,11 @@ var (
 	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:[\d.]+\s+)?(?:sonnet|opus|haiku)(?:\s+[\d.]+)?`)
 	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-sonnet-4-5-20250929 等
 	modelIDPattern = regexp.MustCompile(`(?i)claude-(?:[\d.]+-)*(?:sonnet|opus|haiku)(?:-[\w.]+)*`)
+	// 匹配 ChatGPT 友好名：ChatGPT、ChatGPT 5、ChatGPT-5、ChatGPT 5.4 等
+	chatgptPattern = regexp.MustCompile(`(?i)chatgpt(?:[\s-]*[\d.]+)?`)
+	// 匹配 gpt 形式的模型 ID：gpt-5、gpt-5.4、gpt-5-codex、gpt-5.4-thinking 等
+	// 必须紧跟数字，避免误伤 "gpt" 单词；尾部版本后缀允许短横线连接字母数字
+	gptIDPattern = regexp.MustCompile(`(?i)gpt-[\d.]+(?:-[\w.]+)*`)
 )
 
 // replaceBrandInContent 在前200个字符范围内做品牌名和模型名替换
@@ -103,7 +110,7 @@ func replaceInContent(content string, charsSoFar int, pending string, replacer f
 }
 
 // calcBrandPendingLen 从尾部扫描，判断有多少字符可能是品牌模式的前缀
-// 所有品牌模式都以 "claude"（忽略大小写）或 "kiro" 开头
+// 所有品牌模式都以 "claude"/"kiro"/"chatgpt"/"gpt-"（忽略大小写）开头
 // 只在尾部发现这些前缀时才需要缓冲，否则返回 0（立即输出）
 func calcBrandPendingLen(text string) int {
 	if len(text) == 0 {
@@ -143,6 +150,25 @@ func calcBrandPendingLen(text string) int {
 			}
 			if candidate == "claude" {
 				// 恰好以 "claude" 结尾，可能后续还有 " sonnet" 等
+				return i
+			}
+			// "chatgpt" 前缀检测（不完整或恰好到尾）
+			if strings.HasPrefix("chatgpt", candidate) {
+				return i
+			}
+			if strings.HasPrefix(candidate, "chatgpt") {
+				// "chatgpt" 后面还有字符，可能延伸为 "ChatGPT 5"/"ChatGPT-5" 等
+				return i
+			}
+		}
+		if ch == 'g' {
+			candidate := lower[pos:]
+			// 不完整 "gpt-" 前缀: "g","gp","gpt","gpt-"
+			if strings.HasPrefix("gpt-", candidate) {
+				return i
+			}
+			// "gpt-" 后面的版本号仍可能延伸（如 "gpt-5" 后面可能接 ".4" 或 "-codex"）
+			if strings.HasPrefix(candidate, "gpt-") {
 				return i
 			}
 		}

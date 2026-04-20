@@ -29,6 +29,17 @@ func TestReplaceBrandingWithModel(t *testing.T) {
 		// 不同 modelName 都能正确生效
 		{"different model A", "I am Claude Opus", "model-A", "I am model-A"},
 		{"different model B", "I am Claude Opus", "model-B", "I am model-B"},
+		// gpt / ChatGPT 身份串（上游漂移时的兜底替换）
+		{"gpt-5.4 → opus", "我是 gpt-5.4，一个 AI 助手", "claude-opus-4-6", "我是 claude-opus-4-6，一个 AI 助手"},
+		{"gpt-5 → opus", "I am gpt-5, nice to meet", "claude-opus-4-6", "I am claude-opus-4-6, nice to meet"},
+		{"gpt-5-codex → opus", "gpt-5-codex here", "claude-opus-4-6", "claude-opus-4-6 here"},
+		{"gpt-5.4-thinking → opus", "Hi gpt-5.4-thinking", "claude-opus-4-6", "Hi claude-opus-4-6"},
+		{"GPT-5 uppercase", "GPT-5 ready", "claude-opus-4-6", "claude-opus-4-6 ready"},
+		{"chatgpt space ver", "I am ChatGPT 5", "claude-opus-4-6", "I am claude-opus-4-6"},
+		{"chatgpt dash ver", "I am ChatGPT-5", "claude-opus-4-6", "I am claude-opus-4-6"},
+		{"chatgpt bare", "Hello from ChatGPT!", "claude-opus-4-6", "Hello from claude-opus-4-6!"},
+		// 不应误伤非身份串
+		{"no false positive gpt word", "gpt is an acronym", "claude-opus-4-6", "gpt is an acronym"},
 	}
 
 	for _, tt := range tests {
@@ -38,6 +49,49 @@ func TestReplaceBrandingWithModel(t *testing.T) {
 				t.Errorf("ReplaceBrandingWithModel(%q, %q) = %q, want %q", tt.input, tt.model, got, tt.expected)
 			}
 		})
+	}
+}
+
+// 基准场景：对典型 200 字符开头文本做完整替换管道（含 Kiro/Claude/gpt/ChatGPT 四类命中）
+var benchModel = "claude-opus-4-6"
+
+var benchHitText = "我是 Kiro，也有人叫我 Claude Sonnet 4.5 或 claude-sonnet-4-5-20250929，甚至 ChatGPT 5 / gpt-5.4-thinking。" +
+	"一个专为开发者打造的 AI 助手和 IDE，可以帮你编写代码、分析项目、调试测试、处理基础设施配置。"
+
+var benchMissText = "The quick brown fox jumps over the lazy dog. " +
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " +
+	"Ut enim ad minim veniam, quis nostrud exercitation."
+
+func BenchmarkReplaceBrandingWithModel_Hit(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = ReplaceBrandingWithModel(benchHitText, benchModel)
+	}
+}
+
+func BenchmarkReplaceBrandingWithModel_Miss(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = ReplaceBrandingWithModel(benchMissText, benchModel)
+	}
+}
+
+func BenchmarkReplaceBrandInContent_StreamingChunks(b *testing.B) {
+	// 模拟典型流式场景：20 个短 chunk，共 ~200 字符，分散命中
+	chunks := []string{
+		"我是 ", "Ki", "ro", "，一个", "专为", "开发者", "打造的 ",
+		"AI 助手", "和 IDE。", "也可以", "叫我 ", "Claude ", "Sonnet ",
+		"4.5 或 ", "gpt-", "5.4", "-thinking", "，ChatGPT", " 5 ",
+		"也行。",
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		chars := 0
+		pending := ""
+		for _, c := range chunks {
+			_, chars, pending = replaceBrandInContent(c, chars, pending, benchModel)
+		}
+		_ = pending
 	}
 }
 
