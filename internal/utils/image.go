@@ -35,6 +35,26 @@ func GetImageFormatFromMediaType(mediaType string) string {
 	return ""
 }
 
+// DetectImageFormatFromBase64 通过 base64 数据首部魔数检测图片真实媒体类型。
+// 仅用于校正客户端声明错误的 media_type（例如声明 image/jpeg 但实际是 PNG/WebP）。
+// 返回空字符串表示无法检测，调用方应沿用原声明值。
+func DetectImageFormatFromBase64(b64Data string) string {
+	// 16 个 base64 字符可解码 12 字节，足以覆盖 JPEG/PNG/GIF/WebP/BMP 的魔数
+	head := b64Data
+	if len(head) > 16 {
+		head = head[:16]
+	}
+	decoded, err := base64.StdEncoding.DecodeString(head)
+	if err != nil {
+		return ""
+	}
+	mediaType, err := DetectImageFormat(decoded)
+	if err != nil {
+		return ""
+	}
+	return mediaType
+}
+
 // DetectImageFormat 检测图片格式（通过文件头魔数）
 func DetectImageFormat(data []byte) (string, error) {
 	if len(data) < 12 {
@@ -150,9 +170,15 @@ func ConvertImageURLToAmazonQImage(imageURL map[string]interface{}) (*models.Ama
 		return nil, err
 	}
 
-	format := GetImageFormatFromMediaType(imageSource.MediaType)
+	// 通过魔数校正被错误声明的 media_type（data URL 前缀可能与实际字节不符）
+	mediaType := imageSource.MediaType
+	if detected := DetectImageFormatFromBase64(imageSource.Data); detected != "" && detected != mediaType {
+		mediaType = detected
+	}
+
+	format := GetImageFormatFromMediaType(mediaType)
 	if format == "" {
-		return nil, fmt.Errorf("不支持的图片格式: %s", imageSource.MediaType)
+		return nil, fmt.Errorf("不支持的图片格式: %s", mediaType)
 	}
 
 	return &models.AmazonQImage{

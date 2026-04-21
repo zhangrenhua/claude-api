@@ -1181,15 +1181,22 @@ func extractImagesFromContent(content interface{}) []models.AmazonQImage {
 				mediaType = "image/png"
 			}
 
+			data, _ := source["data"].(string)
+			if data == "" {
+				continue
+			}
+
+			// 通过魔数校正被错误声明的 media_type —— 上游 Amazon Q 会按字节严格校验，
+			// 声明 jpeg 但实际是 PNG/WebP 会被拒为 Improperly formed request。
+			if detected := utils.DetectImageFormatFromBase64(data); detected != "" && detected != mediaType {
+				logger.Warn("[消息转换] 图片 media_type 声明为 %s 但实际为 %s，已按实际格式转发", mediaType, detected)
+				mediaType = detected
+			}
+
 			// 从 media_type 提取格式（如 image/png -> png）
 			format := "png"
 			if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
 				format = mediaType[idx+1:]
-			}
-
-			data, _ := source["data"].(string)
-			if data == "" {
-				continue
 			}
 
 			images = append(images, models.AmazonQImage{
