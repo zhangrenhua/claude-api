@@ -171,7 +171,7 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         addr,
 		Handler:      server.Router(),
-		ReadTimeout:  120 * time.Second, // 覆盖大 context + 多工具的慢上传场景
+		ReadTimeout:  60 * time.Second, // 覆盖大 context + 多工具的慢上传场景
 		WriteTimeout: 300 * time.Second, // 流式响应需要较长超时
 		IdleTimeout:  120 * time.Second,
 	}
