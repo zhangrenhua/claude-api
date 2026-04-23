@@ -40,6 +40,13 @@ func TestReplaceBrandingWithModel(t *testing.T) {
 		{"chatgpt bare", "Hello from ChatGPT!", "claude-opus-4-6", "Hello from claude-opus-4-6!"},
 		// 不应误伤非身份串
 		{"no false positive gpt word", "gpt is an acronym", "claude-opus-4-6", "gpt is an acronym"},
+		// 结尾句号不应被吃掉（之前 `[\w.]+` 会贪婪吞句号）
+		{"kiro trailing period", "I am Kiro. Nice.", "claude-opus-4-6", "I am claude-opus-4-6. Nice."},
+		{"friendly trailing period", "Claude Sonnet 4.5. How", "claude-opus-4-6", "claude-opus-4-6. How"},
+		{"id trailing period", "from claude-3-5-sonnet-20241022.", "claude-opus-4-6", "from claude-opus-4-6."},
+		{"gpt trailing period", "See gpt-5.4. End", "claude-opus-4-6", "See claude-opus-4-6. End"},
+		// 句号后紧跟数字仍属于版本号（合法延伸）
+		{"gpt multi dot version", "See gpt-5.4.1 end", "claude-opus-4-6", "See claude-opus-4-6 end"},
 	}
 
 	for _, tt := range tests {
@@ -112,5 +119,43 @@ func TestReplaceBrandInContent_StreamingPending(t *testing.T) {
 	want := "I am claude-opus-4-7 is"
 	if combined != want {
 		t.Errorf("streaming result = %q, want %q", combined, want)
+	}
+}
+
+// 回归：上游短文本 "Im Kiro, an" 应立即替换并输出，不能整段卡在 pending。
+// （Bug：替换后的 "claude-opus-4-6" 尾部被误判为仍可能增长的品牌前缀）
+func TestReplaceBrandInContent_ShortKiroResponse(t *testing.T) {
+	const modelName = "claude-opus-4-6"
+	emit, _, pending := replaceBrandInContent("Im Kiro, an", 0, "", modelName)
+	// 尾部 ", an" 是终结符后的普通文本，不应再有 pending
+	if pending != "" {
+		t.Errorf("expected empty pending, got %q", pending)
+	}
+	// 替换应完整生效
+	want := "Im claude-opus-4-6, an"
+	if emit != want {
+		t.Errorf("emit = %q, want %q", emit, want)
+	}
+}
+
+// 回归：modelID 已闭合（后跟 ", "/句号后空格等终结符）时不该缓冲
+func TestCalcBrandPendingLen_ClosedPattern(t *testing.T) {
+	cases := []struct {
+		text string
+		want int
+	}{
+		{"Im claude-opus-4-6, an AI assistant", 0}, // 逗号终结
+		{"I am claude-opus-4-6. How", 0},           // 句号+空格终结
+		{"see gpt-5.4, bye", 0},                    // 逗号终结
+		{"see gpt-5.4", 7},                         // 仍可增长，缓冲 "gpt-5.4"（7 字符）
+		{"claude-opus-4-6", 15},                    // 仍可增长 → 整段缓冲
+		{"I am Claud", 5},                          // 不完整 "Claud" → 缓冲 5 字符
+		{"nothing here", 0},                        // 无品牌前缀
+	}
+	for _, c := range cases {
+		got := calcBrandPendingLen(c.text)
+		if got != c.want {
+			t.Errorf("calcBrandPendingLen(%q) = %d, want %d", c.text, got, c.want)
+		}
 	}
 }

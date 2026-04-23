@@ -56,7 +56,7 @@ type OpenAIStreamHandler struct {
 	// token 计数（使用 tokenizer 实际统计，覆盖文本与工具输入）
 	OutputDeltaCount int
 	AllToolInputs    []string
-	// 累计内容字符数，用于前200字符品牌名/模型名替换
+	// 累计内容字符数，用于前100字符品牌名/模型名替换
 	ContentCharCount  int
 	PendingKiroBuffer string
 }
@@ -110,7 +110,7 @@ func (h *OpenAIStreamHandler) HandleEvent(eventType string, payload map[string]i
 		if content != "" {
 			// 按原始内容累计 token（真实 tokenizer 统计）
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
-			// 前200个字符内做品牌名和模型名替换
+			// 前100个字符内做品牌名和模型名替换
 			content, h.ContentCharCount, h.PendingKiroBuffer = replaceBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer, h.Model)
 			h.ResponseBuffer = append(h.ResponseBuffer, content)
 			events = append(events, BuildOpenAIChunk(h.ID, h.Model, content, ""))

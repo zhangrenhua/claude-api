@@ -33,25 +33,31 @@ func replaceBrandingWith(text, kiroReplacement, modelReplacement string) string 
 
 // 品牌名和模型名正则（预编译，忽略大小写）
 var (
+	// 版本号子模式：禁止吞尾部的孤立句号，例如避免 "4.5." 被整体吃掉。
+	// 写法：一个或多个数字，可选后接 ".数字" 的组（至少一位数字，杜绝悬空 '.'）。
+	verNum = `[\d]+(?:\.[\d]+)*`
+	// 模型 ID 尾缀子模式：禁止吞尾部孤立句号。用于 `-xxx` / `-xxx.yyy` 这类 ID 段。
+	idSeg = `[\w]+(?:\.[\w]+)*`
+
 	// Kiro（忽略大小写）
 	kiroPattern = regexp.MustCompile(`(?i)kiro`)
 	// 匹配带括号的完整格式：Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)
-	modelWithParenPattern = regexp.MustCompile(`(?i)claude\s+[\d.]+\s+\w+\s*\(claude-[\w.-]+\)`)
+	modelWithParenPattern = regexp.MustCompile(`(?i)claude\s+` + verNum + `\s+\w+\s*\(claude-[\w.-]+\)`)
 	// 匹配友好名格式：Claude Sonnet、Claude 3.5 Sonnet、Claude Opus 4 等
-	// 尾部可选版本号 (?:\s+[\d.]+)? 确保：
+	// 尾部可选版本号 (?:\s+...)? 确保：
 	//   1. "Claude Sonnet 4.5" 整体匹配（不留下多余的 " 4.5"）
 	//   2. "Claude Opus 4" 替换为自身（幂等，不会叠加出 "4 4 4"）
-	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:[\d.]+\s+)?(?:sonnet|opus|haiku)(?:\s+[\d.]+)?`)
+	//   3. "Claude Sonnet 4.5." 不把句号也吃掉（verNum 禁止悬空点）
+	modelFriendlyPattern = regexp.MustCompile(`(?i)claude\s+(?:` + verNum + `\s+)?(?:sonnet|opus|haiku)(?:\s+` + verNum + `)?`)
 	// 匹配纯模型 ID：claude-3-5-sonnet-20241022、claude-sonnet-4-5-20250929 等
-	modelIDPattern = regexp.MustCompile(`(?i)claude-(?:[\d.]+-)*(?:sonnet|opus|haiku)(?:-[\w.]+)*`)
+	modelIDPattern = regexp.MustCompile(`(?i)claude-(?:` + verNum + `-)*(?:sonnet|opus|haiku)(?:-` + idSeg + `)*`)
 	// 匹配 ChatGPT 友好名：ChatGPT、ChatGPT 5、ChatGPT-5、ChatGPT 5.4 等
-	chatgptPattern = regexp.MustCompile(`(?i)chatgpt(?:[\s-]*[\d.]+)?`)
+	chatgptPattern = regexp.MustCompile(`(?i)chatgpt(?:[\s-]*` + verNum + `)?`)
 	// 匹配 gpt 形式的模型 ID：gpt-5、gpt-5.4、gpt-5-codex、gpt-5.4-thinking 等
-	// 必须紧跟数字，避免误伤 "gpt" 单词；尾部版本后缀允许短横线连接字母数字
-	gptIDPattern = regexp.MustCompile(`(?i)gpt-[\d.]+(?:-[\w.]+)*`)
+	gptIDPattern = regexp.MustCompile(`(?i)gpt-` + verNum + `(?:-` + idSeg + `)*`)
 )
 
-// replaceBrandInContent 在前200个字符范围内做品牌名和模型名替换
+// replaceBrandInContent 在前100个字符范围内做品牌名和模型名替换
 // 智能检测尾部是否可能是品牌模式前缀，仅在必要时缓冲（而非固定窗口）
 // charsSoFar 是已输出的字符数，content 是新的文本块，pending 是上次保留的尾部，modelName 是下游请求模型名
 // 返回：可输出的内容、更新后的字符计数、新的 pending 缓冲
@@ -62,7 +68,7 @@ func replaceBrandInContent(content string, charsSoFar int, pending string, model
 }
 
 func replaceInContent(content string, charsSoFar int, pending string, replacer func(string) string) (string, int, string) {
-	const replaceLimit = 200
+	const replaceLimit = 100
 
 	// 已超过上限，不再替换，flush pending 并直接透传
 	if charsSoFar >= replaceLimit {
@@ -111,7 +117,10 @@ func replaceInContent(content string, charsSoFar int, pending string, replacer f
 
 // calcBrandPendingLen 从尾部扫描，判断有多少字符可能是品牌模式的前缀
 // 所有品牌模式都以 "claude"/"kiro"/"chatgpt"/"gpt-"（忽略大小写）开头
-// 只在尾部发现这些前缀时才需要缓冲，否则返回 0（立即输出）
+// 只在尾部确实是"仍可能增长"的不完整模式时才需要缓冲，否则返回 0（立即输出）。
+//
+// 关键规则：如果候选串里已经遇到了无法延伸模式的字符（如 ','、'!'、换行等），
+// 说明该位置的 brand 匹配已经闭合，后续文字是普通内容，不应整段缓冲。
 func calcBrandPendingLen(text string) int {
 	if len(text) == 0 {
 		return 0
@@ -125,55 +134,95 @@ func calcBrandPendingLen(text string) int {
 	for i := 1; i <= maxScan; i++ {
 		pos := len(lower) - i
 		ch := lower[pos]
-		if ch == 'k' {
-			candidate := lower[pos:]
-			if strings.HasPrefix("kiro", candidate) {
-				return i
-			}
+		candidate := lower[pos:]
+
+		// "kiro" 不完整前缀（"k","ki","kir","kiro"）
+		if ch == 'k' && strings.HasPrefix("kiro", candidate) {
+			return i
 		}
+
 		if ch == 'c' {
-			candidate := lower[pos:]
+			// 不完整的 "claude" 前缀（"c","cl","cla","clau","claud","claude"）
 			if strings.HasPrefix("claude", candidate) {
-				// "c","cl","cla","clau","claud" — 不完整的 "claude" 前缀，需要缓冲
 				return i
 			}
-			if strings.HasPrefix(candidate, "claude") && len(candidate) > 6 {
-				// "claude" 后面还有字符，检查是否可能继续延伸为模式
-				nextCh := candidate[6]
-				if nextCh == ' ' || nextCh == '-' {
-					// 空格: 可能是 "claude sonnet"、"claude 3.5 sonnet" 等
-					// 短横线: 可能是 "claude-3-5-sonnet-20241022" 等
-					return i
-				}
-				// 其他字符（如 "claude!" "claude,"）不可能是模式，跳过
-				continue
-			}
-			if candidate == "claude" {
-				// 恰好以 "claude" 结尾，可能后续还有 " sonnet" 等
-				return i
-			}
-			// "chatgpt" 前缀检测（不完整或恰好到尾）
+			// 不完整的 "chatgpt" 前缀
 			if strings.HasPrefix("chatgpt", candidate) {
 				return i
 			}
-			if strings.HasPrefix(candidate, "chatgpt") {
-				// "chatgpt" 后面还有字符，可能延伸为 "ChatGPT 5"/"ChatGPT-5" 等
+
+			// 已经包含完整 "claude" 但后面还有字符：判断模式是否已经闭合
+			if strings.HasPrefix(candidate, "claude") && len(candidate) > 6 {
+				nextCh := candidate[6]
+				// "claude-...": modelIDPattern 连续字符为 [-\w.]
+				if nextCh == '-' {
+					if brandPatternClosed(candidate[6:], isIDContChar) {
+						continue // 已闭合，不缓冲此位置
+					}
+					return i
+				}
+				// "claude ...": modelFriendlyPattern 允许空格/字母/数字/点
+				if nextCh == ' ' {
+					if brandPatternClosed(candidate[6:], isFriendlyContChar) {
+						continue
+					}
+					return i
+				}
+				// 其他字符（"claude!", "claude,", "claude."）不可能是模式，跳过
+				continue
+			}
+
+			// 已经包含完整 "chatgpt"：同理判断是否闭合
+			if strings.HasPrefix(candidate, "chatgpt") && len(candidate) > 7 {
+				if brandPatternClosed(candidate[7:], isFriendlyContChar) {
+					continue
+				}
 				return i
 			}
 		}
+
 		if ch == 'g' {
-			candidate := lower[pos:]
 			// 不完整 "gpt-" 前缀: "g","gp","gpt","gpt-"
 			if strings.HasPrefix("gpt-", candidate) {
 				return i
 			}
-			// "gpt-" 后面的版本号仍可能延伸（如 "gpt-5" 后面可能接 ".4" 或 "-codex"）
-			if strings.HasPrefix(candidate, "gpt-") {
+			// "gpt-" 后面还有字符，判断是否闭合
+			if strings.HasPrefix(candidate, "gpt-") && len(candidate) > 4 {
+				if brandPatternClosed(candidate[4:], isIDContChar) {
+					continue
+				}
 				return i
 			}
 		}
 	}
 	return 0
+}
+
+// brandPatternClosed 扫描 suffix，若遇到非延续字符（终结符）返回 true，表示 brand 匹配已闭合。
+// 若整个 suffix 都是延续字符则返回 false（仍可能增长，需缓冲）。
+func brandPatternClosed(suffix string, isCont func(byte) bool) bool {
+	for i := 0; i < len(suffix); i++ {
+		if !isCont(suffix[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// isIDContChar 判断字符是否可以继续出现在 "claude-..." / "gpt-..." 型 model ID 里。
+// 对应正则 [-\w.]，即 a-z, 0-9, _, -, .
+func isIDContChar(c byte) bool {
+	return c == '-' || c == '.' || c == '_' ||
+		(c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'z')
+}
+
+// isFriendlyContChar 判断字符是否可以继续出现在 "claude sonnet" / "ChatGPT 5" 型友好名里。
+// 允许空格、字母、数字、点、短横线。
+func isFriendlyContChar(c byte) bool {
+	return c == ' ' || c == '.' || c == '-' || c == '_' ||
+		(c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'z')
 }
 
 // SSE 事件格式化
@@ -344,7 +393,7 @@ type ClaudeStreamHandler struct {
 	ContextUsagePercent float64
 	// 状态管理器（用于验证事件序列）
 	stateManager *SSEStateManager
-	// 累计内容字符数，用于前200字符品牌名/模型名替换
+	// 累计内容字符数，用于前100字符品牌名/模型名替换
 	ContentCharCount   int
 	PendingKiroBuffer  string
 	// 缓存 token 信息（本地计算）
@@ -393,7 +442,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 
 		// 处理带有 thinking 标签检测的内容
 		if content != "" {
-			// 前200个字符内做品牌名和模型名替换
+			// 前100个字符内做品牌名和模型名替换
 			content, h.ContentCharCount, h.PendingKiroBuffer = replaceBrandInContent(content, h.ContentCharCount, h.PendingKiroBuffer, h.Model)
 			// 使用 tokenizer 计算实际 token 数，而不是简单 +1
 			h.OutputDeltaCount += tokenizer.CountTokens(content)
