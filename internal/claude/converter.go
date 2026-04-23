@@ -477,6 +477,69 @@ func mergeConsecutiveToolResults(messages []models.ClaudeMessage) []models.Claud
 	return result
 }
 
+// mergeConsecutiveSameRoleMessages 合并所有连续同角色消息为一条。
+// Anthropic 原生 API 接受相邻同角色消息，但 Amazon Q / CodeWhisperer
+// 要求严格的 user/assistant 交替，否则抛 "Improperly formed request"。
+// 典型触发场景：某些 IDE 插件（Roo Code / Cline 类）先发 tool_result
+// user 消息，再紧跟一条 image+text 的 user 消息描述环境。
+//
+// 本函数假设 mergeConsecutiveToolResults 已先行执行过。
+// content 为字符串时会被包装成 [{type:text,text:<s>}] 再合并。
+func mergeConsecutiveSameRoleMessages(messages []models.ClaudeMessage) []models.ClaudeMessage {
+	if len(messages) < 2 {
+		return messages
+	}
+
+	// toBlocks 将 content 规整为 []interface{}。
+	// 返回值: (blocks, ok)。ok=false 表示遇到未知类型，调用方必须避免有损合并。
+	toBlocks := func(content interface{}) ([]interface{}, bool) {
+		switch c := content.(type) {
+		case nil:
+			return nil, true
+		case []interface{}:
+			return c, true
+		case string:
+			if c == "" {
+				return nil, true
+			}
+			return []interface{}{
+				map[string]interface{}{"type": "text", "text": c},
+			}, true
+		}
+		return nil, false
+	}
+
+	result := make([]models.ClaudeMessage, 0, len(messages))
+	merged := 0
+
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+		if len(result) == 0 || result[len(result)-1].Role != msg.Role {
+			result = append(result, msg)
+			continue
+		}
+		prev := &result[len(result)-1]
+		prevBlocks, prevOK := toBlocks(prev.Content)
+		curBlocks, curOK := toBlocks(msg.Content)
+		if !prevOK || !curOK {
+			// 任一侧为未知类型：放弃合并，保持独立（上游会拒绝，但不静默丢数据）
+			logger.Warn("[消息修复] 发现未知 content 类型，跳过合并 role=%s", msg.Role)
+			result = append(result, msg)
+			continue
+		}
+		combined := make([]interface{}, 0, len(prevBlocks)+len(curBlocks))
+		combined = append(combined, prevBlocks...)
+		combined = append(combined, curBlocks...)
+		prev.Content = interface{}(combined)
+		merged++
+	}
+
+	if merged > 0 {
+		logger.Info("[消息修复] 合并 %d 条连续同角色消息，避免上游拒绝", merged)
+	}
+	return result
+}
+
 // isAllToolResults 检查消息内容是否全部为 tool_result 块
 func isAllToolResults(content interface{}) bool {
 	blocks, ok := content.([]interface{})
@@ -629,6 +692,10 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 	// 合并连续的 tool_result user 消息（某些客户端如 Claude Code 会将同一轮的多个 tool_result 拆成独立 user 消息）
 	req.Messages = mergeConsecutiveToolResults(req.Messages)
 
+	// 再做一次通用同角色合并，兜底处理 tool_result + 普通文本/图片 user 消息相邻的情况
+	// （Roo Code / Cline 类客户端典型模式），否则 CodeWhisperer 会抛 "Improperly formed request"。
+	req.Messages = mergeConsecutiveSameRoleMessages(req.Messages)
+
 	// 检测无限工具调用循环
 	if err := detectToolCallLoop(req.Messages, 3); err != nil {
 		return nil, err
@@ -660,20 +727,29 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		// 递归清理 inputSchema 中 Amazon Q 不接受的字段
 		inputSchema := sanitizeJSONSchema(t.InputSchema)
 
-		// 兜底：若清理后仍为空对象或缺少 type 字段，填充最小合法 JSON Schema，
-		// 避免上游因 `inputSchema.json = {}` 抛 "Improperly formed request"。
+		// 兜底：若清理后为空对象或缺少 type 字段，补齐到最小合法 schema。
 		if len(inputSchema) == 0 {
-			inputSchema = map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{},
-			}
+			inputSchema = map[string]interface{}{"type": "object"}
 			logger.Debug("[消息转换] 工具 %s 的 input_schema 为空，填充最小合法 schema", t.Name)
 		} else if _, hasType := inputSchema["type"]; !hasType {
 			inputSchema["type"] = "object"
-			if _, hasProps := inputSchema["properties"]; !hasProps {
-				inputSchema["properties"] = map[string]interface{}{}
-			}
 			logger.Debug("[消息转换] 工具 %s 的 input_schema 缺少 type，补齐为 object", t.Name)
+		}
+
+		// CodeWhisperer 对 type=object 且 properties 为空/缺失的工具 schema 会抛
+		// "Improperly formed request"（实际观测到大量 ValidationException）。
+		// 注入一个占位无参属性，语义与 "无参数" 等价且上游接受。
+		if typ, _ := inputSchema["type"].(string); typ == "object" {
+			props, _ := inputSchema["properties"].(map[string]interface{})
+			if len(props) == 0 {
+				inputSchema["properties"] = map[string]interface{}{
+					"_noargs": map[string]interface{}{
+						"type":        "string",
+						"description": "unused placeholder (tool takes no arguments)",
+					},
+				}
+				logger.Debug("[消息转换] 工具 %s 的 properties 为空，注入 _noargs 占位避免上游拒绝", t.Name)
+			}
 		}
 
 		// 工具名长度规整：>64 字符的名称会被上游拒绝（ValidationException），

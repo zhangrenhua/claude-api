@@ -492,20 +492,30 @@ func TestConvertClaudeToAmazonQ_WithToolUseHistory(t *testing.T) {
 		t.Error("历史中应有包含 toolUses 的 assistant 消息")
 	}
 
-	// 验证历史中有 user 消息带 toolResults
+	// 验证 toolResults 存在（可能在历史中，也可能因连续同角色合并而落在 currentMessage）
 	foundToolResult := false
-	for _, msg := range result.ConversationState.History {
-		if msg.UserInputMessage != nil && len(msg.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
-			foundToolResult = true
-			tr := msg.UserInputMessage.UserInputMessageContext.ToolResults[0]
-			if tr.ToolUseID != "tool_123" {
-				t.Errorf("toolUseId 应为 'tool_123', got: %s", tr.ToolUseID)
+	checkTR := func(trs []models.ToolResult) bool {
+		for _, tr := range trs {
+			if tr.ToolUseID == "tool_123" {
+				return true
 			}
+		}
+		return false
+	}
+	for _, msg := range result.ConversationState.History {
+		if msg.UserInputMessage != nil && checkTR(msg.UserInputMessage.UserInputMessageContext.ToolResults) {
+			foundToolResult = true
 			break
 		}
 	}
 	if !foundToolResult {
-		t.Error("历史中应有包含 toolResults 的 user 消息")
+		curCtx := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		if checkTR(curCtx.ToolResults) {
+			foundToolResult = true
+		}
+	}
+	if !foundToolResult {
+		t.Error("应能在历史或当前消息中找到 tool_use_id=tool_123 的 toolResult")
 	}
 }
 
@@ -1295,14 +1305,17 @@ func TestConvertClaudeToAmazonQ_EmptyInputSchemaFallback(t *testing.T) {
 	if schema["type"] != "object" {
 		t.Errorf("schema.type 应为 'object', got %v", schema["type"])
 	}
-	if _, ok := schema["properties"]; !ok {
-		t.Error("schema 应包含 properties 字段")
+	props, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatal("schema 应包含 properties 字段")
 	}
-
-	// 序列化后 properties 应为空对象而非缺失
-	data, _ := json.Marshal(schema)
-	if !strings.Contains(string(data), `"properties":{}`) {
-		t.Errorf("properties 应序列化为 {}, got: %s", string(data))
+	// CodeWhisperer 拒绝 properties={} 的 schema（观测到大量 ValidationException），
+	// 这里应注入占位属性，避免上游 "Improperly formed request"。
+	if len(props) == 0 {
+		t.Error("properties 不应为空，必须注入占位属性避免上游拒绝")
+	}
+	if _, hasNoargs := props["_noargs"]; !hasNoargs {
+		t.Errorf("应注入 _noargs 占位属性，got: %v", props)
 	}
 }
 
@@ -1796,5 +1809,90 @@ func TestFixOrphanToolResults_KeepsValidAndDropsPureOrphan(t *testing.T) {
 				t.Errorf("pure-orphan tool_result should be removed")
 			}
 		}
+	}
+}
+
+// TestMergeConsecutiveSameRoleMessages_MixedUserBlocks 验证 tool_result user
+// 紧跟一条 image+text user 消息（Roo Code / Cline 风格）会被合并为一条。
+func TestMergeConsecutiveSameRoleMessages_MixedUserBlocks(t *testing.T) {
+	msgs := []models.ClaudeMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{"type": "tool_use", "id": "toolu_abc", "name": "x", "input": map[string]interface{}{}},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "ok"},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "text", "text": "env info"},
+		}},
+	}
+
+	out := mergeConsecutiveSameRoleMessages(msgs)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 messages after merge, got %d", len(out))
+	}
+	// 确认不再有相邻同角色
+	for i := 1; i < len(out); i++ {
+		if out[i].Role == out[i-1].Role {
+			t.Fatalf("found adjacent same-role at %d/%d", i-1, i)
+		}
+	}
+	last, ok := out[2].Content.([]interface{})
+	if !ok || len(last) != 2 {
+		t.Fatalf("last merged user msg should have 2 blocks, got: %v", out[2].Content)
+	}
+	if m, _ := last[0].(map[string]interface{}); m["type"] != "tool_result" {
+		t.Errorf("block 0 should be tool_result, got %v", last[0])
+	}
+	if m, _ := last[1].(map[string]interface{}); m["type"] != "text" {
+		t.Errorf("block 1 should be text, got %v", last[1])
+	}
+}
+
+// TestMergeConsecutiveSameRoleMessages_StringNormalization 验证字符串内容会被包成 text block 合并
+func TestMergeConsecutiveSameRoleMessages_StringNormalization(t *testing.T) {
+	msgs := []models.ClaudeMessage{
+		{Role: "user", Content: "a"},
+		{Role: "user", Content: "b"},
+	}
+	out := mergeConsecutiveSameRoleMessages(msgs)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 merged message, got %d", len(out))
+	}
+	blocks, ok := out[0].Content.([]interface{})
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got: %v", out[0].Content)
+	}
+}
+
+// TestEmptyPropertiesInjectsPlaceholder 验证 type=object 但 properties 为空时注入 _noargs。
+func TestEmptyPropertiesInjectsPlaceholder(t *testing.T) {
+	req := &models.ClaudeRequest{
+		Model:     "claude-sonnet-4-5-20250929",
+		MaxTokens: 1024,
+		Messages:  []models.ClaudeMessage{{Role: "user", Content: "hi"}},
+		Tools: []models.ClaudeTool{
+			{
+				Name:        "TaskList",
+				Description: "list tasks",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+	}
+	result, err := ConvertClaudeToAmazonQ(req, "", false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	schema := result.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.InputSchema.JSON
+	props, ok := schema["properties"].(map[string]interface{})
+	if !ok || len(props) == 0 {
+		t.Fatalf("properties 应被填充，got: %v", schema["properties"])
+	}
+	if _, has := props["_noargs"]; !has {
+		t.Errorf("应含 _noargs 占位属性，got: %v", props)
 	}
 }
