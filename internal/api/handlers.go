@@ -28,6 +28,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// accountFailSleep 是账号上游请求失败后、向下游返回错误前的默认等待时长。
+// Why: 给上游与本服务一点喘息时间，同时拖慢客户端的失败重试循环，避免雪崩。
+const accountFailSleep = 3 * time.Second
+
+// sleepOrCancel 在 d 时长内睡眠，但若 ctx 被取消则立即返回。
+// Why: 失败响应前的延时不应让客户端断连后仍继续占用 goroutine 和连接资源。
+func sleepOrCancel(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
 // claudeEssentialToolNames 是 Claude Code 的"必留"工具白名单：文件/Shell/检索等早期稳定内置工具。
 // 工具截断按 essential > 普通核心 > MCP 三级优先级保留；该集合内的工具最先被保留、最后被丢弃。
 var claudeEssentialToolNames = map[string]bool{
@@ -2492,6 +2505,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 						}
 						logger.Warn("检测到请求错误，终止重试 - 错误: %s, 提示: %s", nrErr.Message, nrErr.Hint)
 						c.Set("error_message", nrErr.Message)
+						sleepOrCancel(c.Request.Context(), accountFailSleep)
 						c.JSON(http.StatusBadRequest, gin.H{
 							"error": nrErr.Message,
 							"code":  nrErr.Code,
@@ -2535,6 +2549,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		if lastErr != nil {
 			c.Set("error_message", lastErr.Error())
 		}
+		sleepOrCancel(c.Request.Context(), accountFailSleep)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": lastErr.Error()})
 		return
 	}
@@ -3116,6 +3131,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 					s.handleAccountStatusByError(c.Request.Context(), account.ID, nrErr.Code)
 				}
 				c.Set("error_message", nrErr.Message)
+				sleepOrCancel(c.Request.Context(), accountFailSleep)
 				c.JSON(http.StatusBadRequest, gin.H{
 					"error": gin.H{
 						"message": nrErr.Message,
@@ -3129,6 +3145,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 
 		s.QueueStatsUpdate(account.ID, false)
 		c.Set("error_message", err.Error())
+		sleepOrCancel(c.Request.Context(), accountFailSleep)
 		c.JSON(502, gin.H{"error": fmt.Sprintf("发送请求失败: %v", err)})
 		return
 	}
@@ -3559,6 +3576,7 @@ func (s *Server) handleResponses(c *gin.Context) {
 					s.handleAccountStatusByError(c.Request.Context(), account.ID, nrErr.Code)
 				}
 				c.Set("error_message", nrErr.Message)
+				sleepOrCancel(c.Request.Context(), accountFailSleep)
 				c.JSON(http.StatusBadRequest, gin.H{
 					"error": gin.H{
 						"message": nrErr.Message,
@@ -3572,6 +3590,7 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 		s.QueueStatsUpdate(account.ID, false)
 		c.Set("error_message", err.Error())
+		sleepOrCancel(c.Request.Context(), accountFailSleep)
 		c.JSON(502, gin.H{"error": fmt.Sprintf("发送请求失败: %v", err)})
 		return
 	}
