@@ -61,7 +61,12 @@ createApp({
             awsLatencyChecking: false,
 
             // 已加载过数据的tab（切换时不重复加载）
-            loadedTabs: new Set()
+            loadedTabs: new Set(),
+
+            // 激活码弹窗（模板引用，Ultra 版默认不进入触发路径）
+            showLicenseModal: false,
+            licenseCode: '',
+            licenseActivating: false
         };
     },
 
@@ -259,9 +264,6 @@ createApp({
             this.$nextTick(() => {
                 highlightCode();
             });
-
-            // 自动连接服务日志（Tab 切换不影响连接）
-            this.connectServerLogs();
         },
 
         // ========== 按需加载 Tab 数据 ==========
@@ -302,7 +304,7 @@ createApp({
                     // settings 已在初始化时加载
                     break;
                 case 'serverLogs':
-                    // WebSocket 连接已在 connectServerLogs 处理
+                    // 默认不自动连接日志流，由用户在页面上点击"连接"按钮触发
                     break;
                 case 'chat':
                     // chat 需要账号列表用于选择（不加载配额）
@@ -464,6 +466,27 @@ createApp({
          */
         getAwsLatencyClass() {
             return `latency-${this.awsLatencyStatus}`;
+        },
+
+        // ========== 激活码弹窗（Ultra 版无激活流程，仅给模板兜底；版本弹窗里的"激活"按钮可触达此处）==========
+        copyMachineId() {
+            const id = (this.settingsData && this.settingsData.machineId) || '';
+            if (!id) {
+                showToast(this, '机器码暂不可用', 'warning');
+                return;
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(id)
+                    .then(() => showToast(this, '机器码已复制', 'success'))
+                    .catch(() => showToast(this, '复制失败', 'error'));
+            } else {
+                showToast(this, '当前环境不支持自动复制', 'warning');
+            }
+        },
+        handleActivateLicense() {
+            showToast(this, '当前已是 Ultra 版本，无需激活', 'info');
+            this.showLicenseModal = false;
+            this.licenseCode = '';
         }
     }
 }).mount('#app');

@@ -854,12 +854,12 @@ export const accountsMixin = {
             }
         },
 
-        // 启动 RPM 倒计时 ticker（每秒一次，仅本地，不发请求）
+        // 启动 RPM 倒计时 ticker（每 20s 一次，仅本地，不发请求）
         startRPMTicker() {
             if (this._rpmTickerHandle) return;
             this._rpmTickerHandle = setInterval(() => {
                 this._rpmNow = Math.floor(Date.now() / 1000);
-            }, 1000);
+            }, 20000);
         },
         stopRPMTicker() {
             if (this._rpmTickerHandle) {
