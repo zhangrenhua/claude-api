@@ -25,16 +25,36 @@ type AccountPool struct {
 	refreshing      atomic.Bool       // 是否正在刷新
 	roundRobinIndex uint32            // 轮询索引（用于 round_robin 模式）
 	lastUsedTime    sync.Map          // 账号最后使用时间 map[string]time.Time（用于 cooldown 模式）
+	rpmStates       sync.Map          // 账号 RPM 状态 map[string]*rpmAccountState（用于 rpm 模式）
+}
+
+// RPM 模式相关常量
+const (
+	// rpmAccountReleaseCooldown 请求成功结束后账号需冷却的时长
+	rpmAccountReleaseCooldown = 5 * time.Second
+	// rpmAccountInFlightTimeout in-flight 状态的兜底超时，超过则强制释放（防止泄漏）
+	rpmAccountInFlightTimeout = 5 * time.Minute
+)
+
+// rpmAccountState 单个账号的 RPM 调度状态
+type rpmAccountState struct {
+	mu         sync.Mutex
+	timestamps []time.Time // 60 秒滑动窗口内的选号时间戳
+	inFlight   bool        // 当前是否有正在处理的请求
+	claimedAt  time.Time   // 进入 in-flight 的时间（用于兜底超时清理）
+	releaseAt  time.Time   // 最早可被再次选中的时间（请求结束后 + 冷却时长）
 }
 
 // accountPoolConfig 账号池配置
 type accountPoolConfig struct {
-	lazyEnabled      bool   // 是否启用懒加载模式
-	lazyPoolSize     int    // 懒加载池大小
-	lazyOrderBy      string // 懒加载排序字段
-	lazyOrderDesc    bool   // 懒加载是否降序
-	selectionMode    string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown
-	cooldownSeconds  int    // 冷却时间（秒），cooldown 模式下生效
+	lazyEnabled            bool   // 是否启用懒加载模式
+	lazyPoolSize           int    // 懒加载池大小
+	lazyOrderBy            string // 懒加载排序字段
+	lazyOrderDesc          bool   // 懒加载是否降序
+	selectionMode          string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown, rpm
+	cooldownSeconds        int    // 冷却时间（秒），cooldown 模式下生效
+	rpmLimit               int    // 每分钟最多成功完成次数，rpm 模式下生效
+	rpmFailureCooldownSecs int    // 失败后账号冷却时长（秒），rpm 模式下生效
 }
 
 // NewAccountPool 创建新的账号池
@@ -106,6 +126,14 @@ func (p *AccountPool) Refresh(ctx context.Context) {
 	p.cfg.cooldownSeconds = dbCfg.AccountCooldownSeconds
 	if p.cfg.cooldownSeconds <= 0 {
 		p.cfg.cooldownSeconds = models.DefaultAccountCooldownSeconds
+	}
+	p.cfg.rpmLimit = dbCfg.AccountRPMLimit
+	if p.cfg.rpmLimit <= 0 {
+		p.cfg.rpmLimit = models.DefaultAccountRPMLimit
+	}
+	p.cfg.rpmFailureCooldownSecs = dbCfg.AccountRPMFailureCooldownSeconds
+	if p.cfg.rpmFailureCooldownSecs < 0 {
+		p.cfg.rpmFailureCooldownSecs = models.DefaultAccountRPMFailureCooldownSeconds
 	}
 	p.cfg.lazyEnabled = dbCfg.LazyAccountPoolEnabled
 	p.cfg.lazyPoolSize = dbCfg.LazyAccountPoolSize
@@ -199,6 +227,10 @@ func (p *AccountPool) selectAccount(accounts []*models.Account, mode string) *mo
 	case models.AccountSelectionCooldown:
 		// 冷却时间选择
 		return p.selectCooldown(accounts)
+
+	case models.AccountSelectionRPM:
+		// RPM 限制选择
+		return p.selectRPM(accounts)
 
 	default: // sequential 或其他
 		// 顺序选择（返回第一个）
@@ -339,6 +371,104 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 // NotifyUsed 通知账号已被使用（记录使用时间，用于 cooldown 模式）
 func (p *AccountPool) NotifyUsed(accountID string) {
 	p.lastUsedTime.Store(accountID, time.Now())
+}
+
+// selectRPM RPM 限制选择账号
+// 规则：
+//  1. 单账号同时只能有一个 in-flight 请求
+//  2. 请求成功结束 → 5s 冷却；请求失败 → 配置的失败冷却时长（默认 90s）
+//  3. 60 秒滑动窗口内的选号次数达到 rpmLimit 后该账号也不可被选
+//
+// 选号成功时立即在窗口中记录时间戳并占用 in-flight；调用方在请求结束时
+// 必须调用 ReleaseRPM 释放占用并启动冷却（成功传 failed=false，失败传 failed=true）。
+func (p *AccountPool) selectRPM(accounts []*models.Account) *models.Account {
+	p.mu.RLock()
+	limit := p.cfg.rpmLimit
+	p.mu.RUnlock()
+	if limit <= 0 {
+		limit = models.DefaultAccountRPMLimit
+	}
+
+	n := uint32(len(accounts))
+	if n == 0 {
+		return nil
+	}
+	start := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+
+	for i := uint32(0); i < n; i++ {
+		acc := accounts[(start+i)%n]
+		v, _ := p.rpmStates.LoadOrStore(acc.ID, &rpmAccountState{})
+		st := v.(*rpmAccountState)
+
+		st.mu.Lock()
+		// in-flight 兜底：超过最大持续时间视为状态泄漏，强制释放
+		if st.inFlight && now.Sub(st.claimedAt) > rpmAccountInFlightTimeout {
+			logger.Warn("[账号池] RPM 模式: 账号 %s in-flight 持续 %s 已超限，强制释放", acc.ID, rpmAccountInFlightTimeout)
+			st.inFlight = false
+			st.releaseAt = now
+		}
+		if st.inFlight {
+			st.mu.Unlock()
+			continue
+		}
+		if now.Before(st.releaseAt) {
+			st.mu.Unlock()
+			continue
+		}
+		// 清理 60 秒外的过期时间戳
+		kept := st.timestamps[:0]
+		for _, t := range st.timestamps {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		st.timestamps = kept
+		if len(st.timestamps) >= limit {
+			st.mu.Unlock()
+			continue
+		}
+		// 占用账号
+		st.inFlight = true
+		st.claimedAt = now
+		st.timestamps = append(st.timestamps, now)
+		st.mu.Unlock()
+		return acc
+	}
+
+	logger.Debug("[账号池] RPM 模式: 所有 %d 个账号均不可调度（in-flight/冷却中/达上限 %d），拒绝调度", n, limit)
+	return nil
+}
+
+// ReleaseRPM 释放账号的 in-flight 状态并启动冷却
+// failed=false → 固定 5s 成功冷却
+// failed=true → 失败冷却时长由配置 AccountRPMFailureCooldownSeconds 决定（默认 90s，可配置）
+// 多次调用幂等且不会"降级"冷却：releaseAt 仅在新值更晚时才更新，确保 defer 兜底不会
+// 把已设的失败长冷却覆盖为短冷却。对未占用过的账号无副作用
+func (p *AccountPool) ReleaseRPM(accountID string, failed bool) {
+	v, ok := p.rpmStates.Load(accountID)
+	if !ok {
+		return
+	}
+	cooldown := rpmAccountReleaseCooldown
+	if failed {
+		p.mu.RLock()
+		secs := p.cfg.rpmFailureCooldownSecs
+		p.mu.RUnlock()
+		if secs < 0 {
+			secs = models.DefaultAccountRPMFailureCooldownSeconds
+		}
+		cooldown = time.Duration(secs) * time.Second
+	}
+	newReleaseAt := time.Now().Add(cooldown)
+	st := v.(*rpmAccountState)
+	st.mu.Lock()
+	st.inFlight = false
+	if newReleaseAt.After(st.releaseAt) {
+		st.releaseAt = newReleaseAt
+	}
+	st.mu.Unlock()
 }
 
 // GetAccountExcluding 获取一个账号，排除指定的账号 ID

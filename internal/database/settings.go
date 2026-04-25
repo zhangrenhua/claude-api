@@ -27,6 +27,8 @@ func (db *DB) GetSettings(ctx context.Context) (*models.Settings, error) {
 		LayoutFullWidth:         false,
 		AccountSelectionMode:    models.AccountSelectionSequential, // 默认顺序选择
 		AccountCooldownSeconds:  models.DefaultAccountCooldownSeconds, // 默认冷却60秒
+		AccountRPMLimit:         models.DefaultAccountRPMLimit,        // 默认每分钟 3 次
+		AccountRPMFailureCooldownSeconds: models.DefaultAccountRPMFailureCooldownSeconds, // 默认失败冷却 90s
 		CompressionEnabled:      false,
 		CompressionModel:        models.DefaultCompressionModel,
 		QuotaRefreshConcurrency: 20,  // 默认 20 并发
@@ -88,6 +90,16 @@ func (db *DB) GetSettings(ctx context.Context) (*models.Settings, error) {
 			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 {
 				settings.AccountCooldownSeconds = v
 				db.cfg.AccountCooldownSeconds = v
+			}
+		case "account_rpm_limit":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 1 && v <= 1000 {
+				settings.AccountRPMLimit = v
+				db.cfg.AccountRPMLimit = v
+			}
+		case "account_rpm_failure_cooldown_seconds":
+			if v, err := strconv.Atoi(s.Value); err == nil && v >= 0 && v <= 3600 {
+				settings.AccountRPMFailureCooldownSeconds = v
+				db.cfg.AccountRPMFailureCooldownSeconds = v
 			}
 		// 兼容旧的 random_account_selection 配置
 		case "random_account_selection":
@@ -253,6 +265,7 @@ func (db *DB) UpdateSettings(ctx context.Context, updates *models.SettingsUpdate
 				models.AccountSelectionWeightedRandom: true,
 				models.AccountSelectionRoundRobin:     true,
 				models.AccountSelectionCooldown:       true,
+				models.AccountSelectionRPM:            true,
 			}
 			if !validModes[mode] {
 				mode = models.AccountSelectionSequential
@@ -275,6 +288,34 @@ func (db *DB) UpdateSettings(ctx context.Context, updates *models.SettingsUpdate
 				return err
 			}
 			db.cfg.AccountCooldownSeconds = v
+		}
+
+		if updates.AccountRPMLimit != nil {
+			v := *updates.AccountRPMLimit
+			if v < 1 {
+				v = 1
+			}
+			if v > 1000 {
+				v = 1000
+			}
+			if err := upsertSetting("account_rpm_limit", fmt.Sprintf("%d", v)); err != nil {
+				return err
+			}
+			db.cfg.AccountRPMLimit = v
+		}
+
+		if updates.AccountRPMFailureCooldownSeconds != nil {
+			v := *updates.AccountRPMFailureCooldownSeconds
+			if v < 0 {
+				v = 0
+			}
+			if v > 3600 {
+				v = 3600
+			}
+			if err := upsertSetting("account_rpm_failure_cooldown_seconds", fmt.Sprintf("%d", v)); err != nil {
+				return err
+			}
+			db.cfg.AccountRPMFailureCooldownSeconds = v
 		}
 
 		if updates.CompressionEnabled != nil {

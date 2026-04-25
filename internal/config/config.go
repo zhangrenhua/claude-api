@@ -71,8 +71,10 @@ type Config struct {
 	LazyAccountPoolRefreshOffset int
 	LazyAccountPoolOrderBy       string
 	LazyAccountPoolOrderDesc     bool
-	AccountSelectionMode         string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown
+	AccountSelectionMode         string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown, rpm
 	AccountCooldownSeconds       int    // 账号冷却时间（秒），cooldown 模式下生效
+	AccountRPMLimit              int    // 每个账号每分钟最多成功完成次数，rpm 模式下生效
+	AccountRPMFailureCooldownSeconds int // rpm 模式下请求失败后的账号冷却时长（秒）
 	CompressionEnabled           bool   // 是否启用上下文压缩
 
 	// 调试和测试模式
@@ -119,6 +121,8 @@ func Load() *Config {
 		LazyAccountPoolOrderDesc:     false,
 		AccountSelectionMode:         "sequential",
 		AccountCooldownSeconds:       60,
+		AccountRPMLimit:              3,
+		AccountRPMFailureCooldownSeconds: 90,
 		CompressionEnabled:           false,
 		Debug:                        false,
 		Test:                         false,

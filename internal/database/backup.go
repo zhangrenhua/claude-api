@@ -219,6 +219,8 @@ func (db *DB) RestoreData(ctx context.Context, data map[string]interface{}) erro
 				"layoutFullWidth":      "layout_full_width",
 				"accountSelectionMode":    "account_selection_mode",
 				"accountCooldownSeconds":  "account_cooldown_seconds",
+				"accountRPMLimit":         "account_rpm_limit",
+				"accountRPMFailureCooldownSeconds": "account_rpm_failure_cooldown_seconds",
 				"compressionEnabled":   "compression_enabled",
 				"compressionModel":     "compression_model",
 				"announcementEnabled":  "announcement_enabled",

@@ -954,6 +954,14 @@ func (s *Server) requireAccount(c *gin.Context) {
 	// 选择账号
 	account, err := s.selectAccount(c.Request.Context())
 	if err != nil {
+		// 区分"账号池为空"和"全部冷却/RPM 限流中"两种场景，给出更准确的错误码与文案
+		mode := s.accountPool.GetSelectionMode()
+		if (mode == models.AccountSelectionCooldown || mode == models.AccountSelectionRPM) && s.accountPool.Count() > 0 {
+			logger.Warn("所有账号正在冷却/限流中 - 模式: %s - 来源: %s", mode, c.ClientIP())
+			c.JSON(429, gin.H{"error": "所有账号正在冷却中，请稍后重试"})
+			c.Abort()
+			return
+		}
 		logger.Error("选择账号失败: %v - 来源: %s", err, c.ClientIP())
 		c.JSON(503, gin.H{"error": "无可用账号，请先添加并配置账号"})
 		c.Abort()
@@ -962,6 +970,9 @@ func (s *Server) requireAccount(c *gin.Context) {
 
 	// 将账号存储在上下文中
 	c.Set("account", account)
+	// 兜底释放：handler 内部任何路径若漏调 QueueStatsUpdate，仍能保证 RPM 模式下账号被释放
+	// 传 failed=false 仅作兜底；若实际失败 QueueStatsUpdate 已先触发 90s 冷却（max() 不会降级）
+	defer s.accountPool.ReleaseRPM(account.ID, false)
 	c.Next()
 }
 
@@ -1623,9 +1634,15 @@ func (s *Server) dbWriteWorker(workerID int) {
 }
 
 // QueueStatsUpdate 将统计更新加入队列
+// 同时释放 RPM 模式下的账号 in-flight 占用并启动冷却（成功失败均释放）
 func (s *Server) QueueStatsUpdate(accountID string, success bool) {
 	if s.closing.Load() {
 		return // 服务器正在关闭，忽略更新
+	}
+	// 释放 RPM 模式下的占用（仅 rpm 模式有状态，其它模式为空操作）
+	// 失败请求触发 90s 冷却，成功请求触发 5s 冷却
+	if s.accountPool != nil {
+		s.accountPool.ReleaseRPM(accountID, !success)
 	}
 	select {
 	case s.dbWriteChan <- dbWriteOp{opType: "stats", data: statsUpdate{accountID: accountID, success: success}}:

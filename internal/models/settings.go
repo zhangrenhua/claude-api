@@ -19,10 +19,17 @@ const (
 	AccountSelectionWeightedRandom = "weighted_random" // 加权随机选择
 	AccountSelectionRoundRobin     = "round_robin"     // 轮询选择
 	AccountSelectionCooldown       = "cooldown"        // 冷却时间选择
+	AccountSelectionRPM            = "rpm"             // RPM 限制选择（每分钟最多 N 次）
 )
 
 // DefaultAccountCooldownSeconds 默认账号冷却时间（秒）
 const DefaultAccountCooldownSeconds = 60
+
+// DefaultAccountRPMLimit 默认每个账号每分钟最多请求成功完成次数
+const DefaultAccountRPMLimit = 3
+
+// DefaultAccountRPMFailureCooldownSeconds 默认请求失败后账号的冷却时长（秒）
+const DefaultAccountRPMFailureCooldownSeconds = 90
 
 // SupportedAccountSelectionModes 支持的账号选择方式列表
 var SupportedAccountSelectionModes = []map[string]string{
@@ -31,6 +38,7 @@ var SupportedAccountSelectionModes = []map[string]string{
 	{"value": AccountSelectionWeightedRandom, "label": "加权随机", "description": "根据配额剩余、使用时间等因素加权选择"},
 	{"value": AccountSelectionRoundRobin, "label": "轮询选择", "description": "顺序轮流使用每个账号"},
 	{"value": AccountSelectionCooldown, "label": "冷却时间", "description": "每个账号请求完成后需等待冷却时间后才能再被调度"},
+	{"value": AccountSelectionRPM, "label": "RPM 限制", "description": "每个账号 60 秒内成功完成的请求数达到上限后暂不再被调度"},
 }
 
 // Settings 表示系统配置（用于 API 响应）
@@ -48,8 +56,10 @@ type Settings struct {
 	Port                 int      `json:"port"`
 	PortConfigured       bool     `json:"-"` // 标记用户是否配置过端口（不序列化到JSON）
 	LayoutFullWidth      bool     `json:"layoutFullWidth"`
-	AccountSelectionMode    string   `json:"accountSelectionMode"`    // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown
+	AccountSelectionMode    string   `json:"accountSelectionMode"`    // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown, rpm
 	AccountCooldownSeconds  int      `json:"accountCooldownSeconds"`  // 账号冷却时间（秒），cooldown 模式下生效
+	AccountRPMLimit         int      `json:"accountRPMLimit"`         // 每个账号每分钟最多成功完成次数，rpm 模式下生效
+	AccountRPMFailureCooldownSeconds int `json:"accountRPMFailureCooldownSeconds"` // rpm 模式下请求失败后的账号冷却时长（秒）
 	// 代理配置
 	HTTPProxy string `json:"httpProxy"` // HTTP/HTTPS/SOCKS5 代理地址
 	// 代理池配置
@@ -88,6 +98,8 @@ type SettingsUpdate struct {
 	LayoutFullWidth      *bool     `json:"layoutFullWidth"`
 	AccountSelectionMode   *string   `json:"accountSelectionMode"`   // 账号选择方式
 	AccountCooldownSeconds *int      `json:"accountCooldownSeconds"` // 账号冷却时间（秒）
+	AccountRPMLimit        *int      `json:"accountRPMLimit"`        // 每分钟最多成功完成次数
+	AccountRPMFailureCooldownSeconds *int `json:"accountRPMFailureCooldownSeconds"` // 失败冷却时长（秒）
 	// 代理配置
 	HTTPProxy *string `json:"httpProxy"`
 	// 代理池配置

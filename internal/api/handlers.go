@@ -1836,6 +1836,8 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 		"layoutFullWidth":                settings.LayoutFullWidth,
 		"accountSelectionMode":           settings.AccountSelectionMode,
 		"accountCooldownSeconds":         settings.AccountCooldownSeconds,
+		"accountRPMLimit":                settings.AccountRPMLimit,
+		"accountRPMFailureCooldownSeconds": settings.AccountRPMFailureCooldownSeconds,
 		"supportedAccountSelectionModes": models.SupportedAccountSelectionModes,
 		// 代理配置
 		"httpProxy": settings.HTTPProxy,
@@ -1936,6 +1938,11 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 		s.cfg.AccountSelectionMode = *updates.AccountSelectionMode
 		s.accountPool.Refresh(c.Request.Context())
 		logger.Info("账号选择方式已动态更新并立即生效: %s", *updates.AccountSelectionMode)
+	}
+
+	// 冷却时间、RPM 上限或失败冷却变更时，刷新账号池使其立即生效
+	if updates.AccountCooldownSeconds != nil || updates.AccountRPMLimit != nil || updates.AccountRPMFailureCooldownSeconds != nil {
+		s.accountPool.Refresh(c.Request.Context())
 	}
 
 	// 性能优化配置变更时，记录日志
@@ -2409,9 +2416,10 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		// 选择账号（排除已尝试的）
 		acc, err = s.selectAccountExcluding(c.Request.Context(), triedIDs)
 		if err != nil || acc == nil {
-			// 判断是否因为冷却模式导致无账号可用
-			if s.accountPool.GetSelectionMode() == models.AccountSelectionCooldown && s.accountPool.Count() > 0 {
-				logger.Warn("所有账号冷却中 - 来源: %s", clientIP)
+			// 判断是否因为冷却或 RPM 限流导致无账号可用（账号池里有账号但都不可调度）
+			mode := s.accountPool.GetSelectionMode()
+			if (mode == models.AccountSelectionCooldown || mode == models.AccountSelectionRPM) && s.accountPool.Count() > 0 {
+				logger.Warn("所有账号正在冷却/限流中 - 模式: %s, 来源: %s", mode, clientIP)
 				c.Set("error_message", "所有账号正在冷却中，请稍后重试")
 				c.JSON(http.StatusTooManyRequests, gin.H{"error": "所有账号正在冷却中，请稍后重试"})
 				return
@@ -2422,6 +2430,10 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			return
 		}
 		triedIDs = append(triedIDs, acc.ID)
+		// 兜底释放：覆盖所有提前 return/continue 路径
+		// 传 failed=false 仅作"成功冷却"兜底；若此账号实际失败过，QueueStatsUpdate 已先触发 90s 冷却
+		// ReleaseRPM 内部用 max() 保证更长冷却不被降级
+		defer s.accountPool.ReleaseRPM(acc.ID, false)
 
 		// 被动刷新策略：确保账号可用（刷新令牌和配额）
 		// 执行流程：检查令牌 -> 刷新配额 -> 配额错误时刷新令牌 -> 重试
@@ -3927,6 +3939,8 @@ func (s *Server) handleConsoleChatTest(c *gin.Context) {
 	}
 
 	c.Set("account", account)
+	// 兜底释放：保证 handler 内部任何提前 return 路径下账号都被释放（不会降级失败长冷却）
+	defer s.accountPool.ReleaseRPM(account.ID, false)
 	s.handleChatCompletions(c)
 }
 
