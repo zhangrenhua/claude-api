@@ -212,6 +212,15 @@ export async function refreshAllQuotas() {
 }
 
 /**
+ * 解除所有账号的 RPM 冷却（仅 RPM 模式有效）
+ */
+export async function clearRPMCooldowns() {
+    const response = await authenticatedFetch('/v2/accounts/clear-rpm-cooldowns', { method: 'POST' });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+/**
  * 获取信息不全的账号列表
  */
 export async function fetchIncompleteAccounts() {

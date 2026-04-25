@@ -130,9 +130,18 @@ createApp({
             }
         };
         document.addEventListener('mouseenter', this._handleTooltipPosition, true);
+
+        // 启动 RPM 倒计时 ticker（每秒刷新冷却剩余秒数；不发请求）
+        if (typeof this.startRPMTicker === 'function') {
+            this.startRPMTicker();
+        }
     },
 
     beforeUnmount() {
+        // 停止 RPM ticker
+        if (typeof this.stopRPMTicker === 'function') {
+            this.stopRPMTicker();
+        }
         // 清理全局事件监听器
         if (this._handleGlobalClick) {
             document.removeEventListener('click', this._handleGlobalClick);

@@ -441,6 +441,68 @@ func (p *AccountPool) selectRPM(accounts []*models.Account) *models.Account {
 	return nil
 }
 
+// RPMSnapshot 单个账号的 RPM 状态快照（用于账号列表展示）
+type RPMSnapshot struct {
+	InFlight          bool  `json:"inFlight"`          // 当前是否有正在处理的请求
+	CooldownRemaining int   `json:"cooldownRemaining"` // 剩余冷却秒数
+	RecentCount       int   `json:"recentCount"`       // 60s 滑动窗口内已用次数
+	ReleaseAt         int64 `json:"releaseAt"`         // 最早可被选中的 unix 秒，前端可自行倒计时
+}
+
+// GetRPMSnapshot 非破坏性读取账号的 RPM 状态快照
+// 锁内只复制几个字段（~100ns 级），不会争用热路径
+// 不修改 timestamps（不在读路径里 prune）
+func (p *AccountPool) GetRPMSnapshot(accountID string) (RPMSnapshot, bool) {
+	v, ok := p.rpmStates.Load(accountID)
+	if !ok {
+		return RPMSnapshot{}, false
+	}
+	st := v.(*rpmAccountState)
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+
+	st.mu.Lock()
+	snap := RPMSnapshot{
+		InFlight:  st.inFlight,
+		ReleaseAt: 0,
+	}
+	if !st.releaseAt.IsZero() {
+		snap.ReleaseAt = st.releaseAt.Unix()
+	}
+	for _, t := range st.timestamps {
+		if t.After(cutoff) {
+			snap.RecentCount++
+		}
+	}
+	releaseAt := st.releaseAt
+	st.mu.Unlock()
+
+	if releaseAt.After(now) {
+		snap.CooldownRemaining = int(releaseAt.Sub(now).Seconds())
+		if snap.CooldownRemaining < 1 {
+			snap.CooldownRemaining = 1 // 不到 1s 也展示 1，避免显示 0 引起歧义
+		}
+	}
+	return snap, true
+}
+
+// ClearAllRPMCooldowns 立即解除所有账号的 RPM 冷却与 60s 窗口计数
+// 不会动 inFlight（避免破坏正在处理的请求；in-flight 兜底超时仍生效）
+// 返回受影响的账号数（即 rpmStates 中存在记录的账号数）
+func (p *AccountPool) ClearAllRPMCooldowns() int {
+	count := 0
+	p.rpmStates.Range(func(key, value any) bool {
+		st := value.(*rpmAccountState)
+		st.mu.Lock()
+		st.releaseAt = time.Time{}
+		st.timestamps = st.timestamps[:0]
+		st.mu.Unlock()
+		count++
+		return true
+	})
+	return count
+}
+
 // ReleaseRPM 释放账号的 in-flight 状态并启动冷却
 // failed=false → 固定 5s 成功冷却
 // failed=true → 失败冷却时长由配置 AccountRPMFailureCooldownSeconds 决定（默认 90s，可配置）

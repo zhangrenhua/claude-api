@@ -342,6 +342,20 @@ func (s *Server) handleFeedAccounts(c *gin.Context) {
 	})
 }
 
+// handleClearRPMCooldowns 解除所有账号的 RPM 冷却（包括失败 90s 冷却 + 60s 窗口计数）
+// 不会影响 in-flight 状态（避免破坏正在处理的请求）
+func (s *Server) handleClearRPMCooldowns(c *gin.Context) {
+	logger.Info("解除 RPM 冷却 - 请求来源: %s", c.ClientIP())
+	mode := s.accountPool.GetSelectionMode()
+	count := s.accountPool.ClearAllRPMCooldowns()
+	logger.Info("已解除 RPM 冷却 - 模式: %s, 影响账号数: %d", mode, count)
+	c.JSON(200, gin.H{
+		"success":              true,
+		"affected":             count,
+		"accountSelectionMode": mode,
+	})
+}
+
 func (s *Server) handleListAccounts(c *gin.Context) {
 	logger.Info("列出账号列表 - 请求来源: %s", c.ClientIP())
 
@@ -390,8 +404,11 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 
 	// 只返回展示所需的基本信息，不返回敏感数据
 	simplifiedAccounts := make([]map[string]interface{}, len(accounts))
+	// 仅当账号选择模式为 RPM 时附带 RPM 调度状态（其它模式下读不到有意义的值）
+	isRPM := s.accountPool.GetSelectionMode() == models.AccountSelectionRPM
+
 	for i, acc := range accounts {
-		simplifiedAccounts[i] = map[string]interface{}{
+		item := map[string]interface{}{
 			"id":                  acc.ID,
 			"label":               acc.Label,
 			"enabled":             acc.Enabled,
@@ -412,6 +429,21 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 			"quota_refreshed_at": acc.QuotaRefreshedAt,
 			"token_expiry":       acc.TokenExpiry, // 有效时间 @author ygw
 		}
+		if isRPM {
+			if snap, ok := s.accountPool.GetRPMSnapshot(acc.ID); ok {
+				item["rpm_in_flight"] = snap.InFlight
+				item["rpm_cooldown_remaining"] = snap.CooldownRemaining
+				item["rpm_recent_count"] = snap.RecentCount
+				item["rpm_release_at"] = snap.ReleaseAt
+			} else {
+				// 无记录（从未被调度过）→ 显式给 0，前端便于统一渲染
+				item["rpm_in_flight"] = false
+				item["rpm_cooldown_remaining"] = 0
+				item["rpm_recent_count"] = 0
+				item["rpm_release_at"] = 0
+			}
+		}
+		simplifiedAccounts[i] = item
 	}
 
 	// 获取总配额统计 @author ygw
@@ -483,9 +515,10 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 			"pageSize": pagination.PageSize,
 			"pages":    pagination.Pages,
 		},
-		"quotaStats":   quotaStatsResponse,   // 总配额统计 @author ygw
-		"accountStats": accountStatsResponse, // 账号统计 @author ygw
-		"statusStats":  statusStatsResponse,  // 各状态数量统计 @author ygw
+		"quotaStats":           quotaStatsResponse,                 // 总配额统计 @author ygw
+		"accountStats":         accountStatsResponse,               // 账号统计 @author ygw
+		"statusStats":          statusStatsResponse,                // 各状态数量统计 @author ygw
+		"accountSelectionMode": s.accountPool.GetSelectionMode(),   // 让前端知道是否需要展示 RPM 状态列
 	})
 }
 

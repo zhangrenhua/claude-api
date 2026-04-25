@@ -134,6 +134,7 @@ func (s *Server) setupConsoleRoutes(r *gin.Engine) {
 		accountsGroup.POST("/:id/refresh", s.handleRefreshAccount)
 		accountsGroup.POST("/sync-emails", s.handleSyncAccountEmails)   // 同步所有账号邮箱
 		accountsGroup.POST("/refresh-quotas", s.handleRefreshAllQuotas) // 手动刷新所有账号配额 @author ygw - 被动刷新策略
+		accountsGroup.POST("/clear-rpm-cooldowns", s.handleClearRPMCooldowns) // 解除所有账号的 RPM 冷却（仅 RPM 模式有效）
 	}
 
 	// 控制台 API 测试（绕过 API key 检查）

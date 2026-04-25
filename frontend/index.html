@@ -376,6 +376,9 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                         <button class="btn btn--secondary" @click="handleRefreshAllQuotas" :disabled="isRefreshingQuotas" data-tooltip="刷新所有启用账号的配额信息">
                             <i class="btn-icon ri-pie-chart-line" :class="{'is-spinning': isRefreshingQuotas}"></i> 刷新配额
                         </button>
+                        <button v-if="currentSelectionMode === 'rpm'" class="btn btn--secondary" @click="handleClearRPMCooldowns" :disabled="isClearingCooldowns" data-tooltip="立即解除所有账号的 RPM 冷却（包括失败 90s 冷却）；不会中断进行中的请求">
+                            <i class="btn-icon ri-shield-flash-line" :class="{'is-spinning': isClearingCooldowns}"></i> 解除冷却
+                        </button>
                         <button class="btn btn--secondary" @click="handleRefreshAllAccounts" :disabled="isRefreshingAll" data-tooltip="刷新所有启用账号的 Token 并重新加载列表">
                             <i class="btn-icon ri-refresh-line" :class="{'is-spinning': isRefreshingAll}"></i> 刷新
                         </button>
@@ -487,6 +490,7 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                     失败
                                     <i class="sort-icon" :class="accountSortField === 'error' ? (accountSortOrder === 'asc' ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line') : 'ri-arrow-up-down-line'"></i>
                                 </th>
+                                <th class="col-rpm" v-if="currentSelectionMode === 'rpm'" data-tooltip="RPM 调度状态：处理中 / 冷却倒计时 / 60s 窗口已用次数">RPM 状态</th>
                                 <th class="col-quota sortable" @click="sortAccountsBy('quota')" :class="{'sort-active': accountSortField === 'quota'}">
                                     配额
                                     <i class="sort-icon" :class="accountSortField === 'quota' ? (accountSortOrder === 'asc' ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line') : 'ri-arrow-up-down-line'"></i>
@@ -543,6 +547,12 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                 </td>
                                 <td class="col-error">
                                     <span class="count-badge count-badge--error">{{ account.error_count || 0 }}</span>
+                                </td>
+                                <td class="col-rpm" v-if="currentSelectionMode === 'rpm'">
+                                    <div class="rpm-status">
+                                        <span class="status-badge" :class="getRPMBadgeClass(account)">{{ getRPMBadgeLabel(account) }}</span>
+                                        <small class="rpm-recent">{{ account.rpm_recent_count || 0 }} 次/60s</small>
+                                    </div>
                                 </td>
                                 <td class="col-quota" @click="loadSingleAccountQuota(account.id, 0, true)"
                                     :data-tooltip="getQuotaTooltip(account.id)">

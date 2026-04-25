@@ -11,6 +11,13 @@ export const accountsMixin = {
     data() {
         return {
             accounts: [],
+            // 账号选择模式（来自列表接口）；用于决定是否展示 RPM 状态列
+            currentSelectionMode: '',
+            // 解除冷却按钮 loading
+            isClearingCooldowns: false,
+            // 客户端 tick：每秒 +1，让基于 release_at 计算的剩余秒数自动响应式刷新
+            _rpmNow: Math.floor(Date.now() / 1000),
+            _rpmTickerHandle: null,
             accountQuotas: {}, // 账号配额缓存 { accountId: { used, limit, loading, error } }
             isLoadingAccounts: false,
             isRefreshingAll: false,
@@ -367,6 +374,10 @@ export const accountsMixin = {
                 // 保存各状态账号数量统计 @author ygw
                 if (result.statusStats) {
                     this.statusStats = result.statusStats;
+                }
+                // 保存账号选择模式（用于决定是否显示 RPM 状态列）
+                if (result.accountSelectionMode !== undefined) {
+                    this.currentSelectionMode = result.accountSelectionMode;
                 }
 
                 // 从账号列表数据初始化配额信息（不再单独调用 API）
@@ -840,6 +851,69 @@ export const accountsMixin = {
                 showToast(this, '刷新配额失败: ' + error.message, 'error');
             } finally {
                 this.isRefreshingQuotas = false;
+            }
+        },
+
+        // 启动 RPM 倒计时 ticker（每秒一次，仅本地，不发请求）
+        startRPMTicker() {
+            if (this._rpmTickerHandle) return;
+            this._rpmTickerHandle = setInterval(() => {
+                this._rpmNow = Math.floor(Date.now() / 1000);
+            }, 1000);
+        },
+        stopRPMTicker() {
+            if (this._rpmTickerHandle) {
+                clearInterval(this._rpmTickerHandle);
+                this._rpmTickerHandle = null;
+            }
+        },
+
+        // 计算账号当前剩余冷却秒数（结合 release_at 与本地时钟，做客户端倒计时）
+        getRPMCooldownRemaining(account) {
+            if (!account || !account.rpm_release_at) return 0;
+            const remaining = account.rpm_release_at - this._rpmNow;
+            return remaining > 0 ? remaining : 0;
+        },
+
+        // 状态徽章文案
+        getRPMBadgeLabel(account) {
+            if (!account) return '空闲';
+            if (account.rpm_in_flight) return '处理中';
+            const remaining = this.getRPMCooldownRemaining(account);
+            if (remaining > 0) {
+                // 长冷却（> 5s）大概率是失败 90s 冷却；短冷却是成功后的 5s
+                return remaining > 5 ? `限流冷却 ${remaining}s` : `冷却 ${remaining}s`;
+            }
+            return '空闲';
+        },
+
+        // 状态徽章样式类
+        getRPMBadgeClass(account) {
+            if (!account) return 'status-badge--enabled';
+            if (account.rpm_in_flight) return 'status-badge--exhausted'; // 蓝色/紫色调
+            const remaining = this.getRPMCooldownRemaining(account);
+            if (remaining > 5) return 'status-badge--suspended';  // 失败长冷却 - 红/橙
+            if (remaining > 0) return 'status-badge--disabled';    // 短冷却 - 灰
+            return 'status-badge--enabled';                         // 空闲 - 绿
+        },
+
+        // 解除所有账号的 RPM 冷却（包括失败 90s 冷却 + 60s 滑动窗口计数）
+        // 不影响 in-flight 状态
+        async handleClearRPMCooldowns() {
+            if (this.isClearingCooldowns) return;
+            this.isClearingCooldowns = true;
+            try {
+                const result = await API.clearRPMCooldowns();
+                if (result && result.success) {
+                    showToast(this, `已解除 ${result.affected || 0} 个账号的 RPM 冷却`, 'success');
+                    await this.handleLoadAccounts();
+                } else {
+                    showToast(this, '解除冷却失败', 'error');
+                }
+            } catch (error) {
+                showToast(this, '解除冷却失败: ' + error.message, 'error');
+            } finally {
+                this.isClearingCooldowns = false;
             }
         },
 
