@@ -19,13 +19,13 @@ const (
 	AccountSelectionWeightedRandom = "weighted_random" // 加权随机选择
 	AccountSelectionRoundRobin     = "round_robin"     // 轮询选择
 	AccountSelectionCooldown       = "cooldown"        // 冷却时间选择
-	AccountSelectionRPM            = "rpm"             // RPM 限制选择（每分钟最多 N 次）
+	AccountSelectionRPM            = "rpm"             // RPM 限制选择（每个账号 60s 滑动窗口内最多被调度 N 次，含失败）
 )
 
 // DefaultAccountCooldownSeconds 默认账号冷却时间（秒）
 const DefaultAccountCooldownSeconds = 60
 
-// DefaultAccountRPMLimit 默认每个账号每分钟最多请求成功完成次数
+// DefaultAccountRPMLimit 默认每个账号 60 秒滑动窗口内最多被调度次数（含失败请求）
 const DefaultAccountRPMLimit = 3
 
 // DefaultAccountRPMFailureCooldownSeconds 默认请求失败后账号的冷却时长（秒）
@@ -38,7 +38,7 @@ var SupportedAccountSelectionModes = []map[string]string{
 	{"value": AccountSelectionWeightedRandom, "label": "加权随机", "description": "根据配额剩余、使用时间等因素加权选择"},
 	{"value": AccountSelectionRoundRobin, "label": "轮询选择", "description": "顺序轮流使用每个账号"},
 	{"value": AccountSelectionCooldown, "label": "冷却时间", "description": "每个账号请求完成后需等待冷却时间后才能再被调度"},
-	{"value": AccountSelectionRPM, "label": "RPM 限制", "description": "每个账号 60 秒内成功完成的请求数达到上限后暂不再被调度"},
+	{"value": AccountSelectionRPM, "label": "RPM 限制", "description": "每个账号 60 秒滑动窗口内被调度次数达到上限后暂不再被调度（失败请求也计入额度，保证不击穿上游 RPM）"},
 }
 
 // Settings 表示系统配置（用于 API 响应）
@@ -58,7 +58,7 @@ type Settings struct {
 	LayoutFullWidth      bool     `json:"layoutFullWidth"`
 	AccountSelectionMode    string   `json:"accountSelectionMode"`    // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown, rpm
 	AccountCooldownSeconds  int      `json:"accountCooldownSeconds"`  // 账号冷却时间（秒），cooldown 模式下生效
-	AccountRPMLimit         int      `json:"accountRPMLimit"`         // 每个账号每分钟最多成功完成次数，rpm 模式下生效
+	AccountRPMLimit         int      `json:"accountRPMLimit"`         // 每个账号 60 秒滑动窗口内最多被调度次数（含失败），rpm 模式下生效
 	AccountRPMFailureCooldownSeconds int `json:"accountRPMFailureCooldownSeconds"` // rpm 模式下请求失败后的账号冷却时长（秒）
 	// 代理配置
 	HTTPProxy string `json:"httpProxy"` // HTTP/HTTPS/SOCKS5 代理地址
@@ -98,7 +98,7 @@ type SettingsUpdate struct {
 	LayoutFullWidth      *bool     `json:"layoutFullWidth"`
 	AccountSelectionMode   *string   `json:"accountSelectionMode"`   // 账号选择方式
 	AccountCooldownSeconds *int      `json:"accountCooldownSeconds"` // 账号冷却时间（秒）
-	AccountRPMLimit        *int      `json:"accountRPMLimit"`        // 每分钟最多成功完成次数
+	AccountRPMLimit        *int      `json:"accountRPMLimit"`        // 60 秒滑动窗口内最多被调度次数（含失败）
 	AccountRPMFailureCooldownSeconds *int `json:"accountRPMFailureCooldownSeconds"` // 失败冷却时长（秒）
 	// 代理配置
 	HTTPProxy *string `json:"httpProxy"`

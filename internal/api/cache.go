@@ -33,7 +33,7 @@ const (
 	// rpmAccountReleaseCooldown 请求成功结束后账号需冷却的时长
 	rpmAccountReleaseCooldown = 5 * time.Second
 	// rpmAccountInFlightTimeout in-flight 状态的兜底超时，超过则强制释放（防止泄漏）
-	rpmAccountInFlightTimeout = 5 * time.Minute
+	rpmAccountInFlightTimeout = 3 * time.Minute
 )
 
 // rpmAccountState 单个账号的 RPM 调度状态
@@ -53,7 +53,7 @@ type accountPoolConfig struct {
 	lazyOrderDesc          bool   // 懒加载是否降序
 	selectionMode          string // 账号选择方式: sequential, random, weighted_random, round_robin, cooldown, rpm
 	cooldownSeconds        int    // 冷却时间（秒），cooldown 模式下生效
-	rpmLimit               int    // 每分钟最多成功完成次数，rpm 模式下生效
+	rpmLimit               int    // 60 秒滑动窗口内最多被调度次数（含失败），rpm 模式下生效
 	rpmFailureCooldownSecs int    // 失败后账号冷却时长（秒），rpm 模式下生效
 }
 
@@ -186,8 +186,44 @@ func (p *AccountPool) Refresh(ctx context.Context) {
 	p.lastRefresh = time.Now()
 	p.mu.Unlock()
 
+	// 清理已离池账号在 rpmStates 中的残留状态（避免长期内存泄漏 + 防止账号同 ID 重建时继承老冷却）
+	activeIDs := make(map[string]struct{}, len(accounts))
+	for _, a := range accounts {
+		activeIDs[a.ID] = struct{}{}
+	}
+	if removed := p.pruneRPMStates(activeIDs); removed > 0 {
+		logger.Debug("[账号池] RPM 状态清理: 移除 %d 个已离池账号的状态", removed)
+	}
+
 	elapsed := time.Since(startTime)
 	logger.Debug("[账号池] 刷新完成 - 账号数: %d, 选择方式: %s, 耗时: %.0fms", len(accounts), cfg.selectionMode, elapsed.Seconds()*1000)
+}
+
+// pruneRPMStates 清理已不在账号池中的账号的 RPM 状态
+// 跳过 in-flight 状态的账号（仍在执行的请求结束后由下次 Refresh 收敛）
+// 返回被清理的条目数
+func (p *AccountPool) pruneRPMStates(activeIDs map[string]struct{}) int {
+	removed := 0
+	p.rpmStates.Range(func(key, value any) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, alive := activeIDs[id]; alive {
+			return true
+		}
+		st := value.(*rpmAccountState)
+		st.mu.Lock()
+		inFlight := st.inFlight
+		st.mu.Unlock()
+		if inFlight {
+			return true
+		}
+		p.rpmStates.Delete(key)
+		removed++
+		return true
+	})
+	return removed
 }
 
 // GetAccount 获取一个账号（根据配置选择方式）

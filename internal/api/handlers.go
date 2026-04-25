@@ -2471,15 +2471,18 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		// 被动刷新策略：确保账号可用（刷新令牌和配额）
 		// 执行流程：检查令牌 -> 刷新配额 -> 配额错误时刷新令牌 -> 重试
 		// 整个过程对用户透明无感知
+		failedID := triedIDs[len(triedIDs)-1]
 		acc, err = s.EnsureAccountReady(c.Request.Context(), acc)
 		if err != nil {
-			logger.Warn("账号 %s 被动刷新失败: %v，尝试换号", triedIDs[len(triedIDs)-1], err)
+			logger.Warn("账号 %s 被动刷新失败: %v，尝试换号", failedID, err)
+			s.QueueStatsUpdate(failedID, false)
 			continue
 		}
 
 		// 确保有访问令牌
 		if acc == nil || acc.AccessToken == nil || *acc.AccessToken == "" {
 			logger.Warn("账号被动刷新后仍无访问令牌")
+			s.QueueStatsUpdate(failedID, false)
 			continue
 		}
 
@@ -2519,6 +2522,11 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 							rawBody, _ := c.Get("raw_request_body")
 							rawBodyStr, _ := rawBody.(string)
 							logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+						}
+
+						// 模型不可用：打印请求模型和上游响应，便于定位
+						if nrErr.Code == "INVALID_MODEL" {
+							logger.Warn("【模型不可用】请求模型: %s, 上游响应: %s", req.Model, nrErr.UpstreamBody)
 						}
 
 						// 如果是上下文超出错误，尝试压缩后重试
@@ -3093,15 +3101,18 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	// 被动刷新策略：确保账号可用（刷新令牌和配额）
 	// 执行流程：检查令牌 -> 刷新配额 -> 配额错误时刷新令牌 -> 重试
 	// 整个过程对用户透明无感知
+	preparedID := account.ID
 	account, err = s.EnsureAccountReady(c.Request.Context(), account)
 	if err != nil {
 		logger.Error("账号被动刷新失败: %v", err)
+		s.QueueStatsUpdate(preparedID, false)
 		c.Set("error_message", "账号准备失败: "+err.Error())
 		c.JSON(502, gin.H{"error": "账号准备失败，请稍后重试"})
 		return
 	}
 	if account == nil || account.AccessToken == nil || *account.AccessToken == "" {
 		logger.Error("账号被动刷新后仍无访问令牌")
+		s.QueueStatsUpdate(preparedID, false)
 		c.Set("error_message", "账号没有访问令牌，请确保账号有有效的刷新令牌")
 		c.JSON(503, gin.H{"error": "账号没有访问令牌，请确保账号有有效的刷新令牌"})
 		return
@@ -3136,6 +3147,11 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 					rawBody, _ := c.Get("raw_request_body")
 					rawBodyStr, _ := rawBody.(string)
 					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+				}
+
+				// 模型不可用：打印请求模型和上游响应，便于定位
+				if nrErr.Code == "INVALID_MODEL" {
+					logger.Warn("【模型不可用】请求模型: %s, 上游响应: %s", req.Model, nrErr.UpstreamBody)
 				}
 
 				// 如果是上下文超出错误，尝试压缩后重试
@@ -3533,15 +3549,18 @@ func (s *Server) handleResponses(c *gin.Context) {
 	logger.Info("Responses 请求 - 模型: %s, 流式: %v, 消息数: %d, 工具数: %d", chatReq.Model, chatReq.Stream, len(chatReq.Messages), len(chatReq.Tools))
 
 	// 被动刷新策略：确保账号可用
+	preparedID := account.ID
 	account, err = s.EnsureAccountReady(c.Request.Context(), account)
 	if err != nil {
 		logger.Error("账号被动刷新失败: %v", err)
+		s.QueueStatsUpdate(preparedID, false)
 		c.Set("error_message", "账号准备失败: "+err.Error())
 		c.JSON(502, gin.H{"error": "账号准备失败，请稍后重试"})
 		return
 	}
 	if account == nil || account.AccessToken == nil || *account.AccessToken == "" {
 		logger.Error("账号被动刷新后仍无访问令牌")
+		s.QueueStatsUpdate(preparedID, false)
 		c.Set("error_message", "账号没有访问令牌")
 		c.JSON(503, gin.H{"error": "账号没有访问令牌，请确保账号有有效的刷新令牌"})
 		return
@@ -3583,6 +3602,11 @@ func (s *Server) handleResponses(c *gin.Context) {
 					rawBody, _ := c.Get("raw_request_body")
 					rawBodyStr, _ := rawBody.(string)
 					logger.DumpInvalidRequest(rawBodyStr, string(aqPayloadJSON), nrErr.UpstreamBody)
+				}
+
+				// 模型不可用：打印请求模型和上游响应，便于定位
+				if nrErr.Code == "INVALID_MODEL" {
+					logger.Warn("【模型不可用】请求模型: %s, 上游响应: %s", chatReq.Model, nrErr.UpstreamBody)
 				}
 
 				if nrErr.Code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" || nrErr.Code == "INPUT_TOO_LONG" {

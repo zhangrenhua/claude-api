@@ -1512,7 +1512,7 @@ export ANTHROPIC_API_KEY=你的API密钥</code></pre>
                                 <div class="form-group" v-if="settingsData.accountSelectionMode === 'rpm'">
                                     <label class="form-label">RPM 限制（次/分钟）</label>
                                     <input type="number" class="form-input" v-model.number="settingsData.accountRPMLimit" min="1" max="1000" placeholder="3">
-                                    <small class="form-hint">每个账号在过去 60 秒滑动窗口内成功完成的请求数达到上限后暂停调度，范围 1-1000，默认 3</small>
+                                    <small class="form-hint">每个账号在过去 60 秒滑动窗口内被调度的次数达到上限后暂停被选；失败请求也计入额度（保守策略，保证不击穿上游 RPM）。范围 1-1000，默认 3</small>
                                 </div>
                                 <div class="form-group" v-if="settingsData.accountSelectionMode === 'rpm'">
                                     <label class="form-label">失败冷却时长（秒）</label>
