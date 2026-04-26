@@ -16,16 +16,17 @@ import (
 // 避免每次请求都查询数据库，显著提升高并发性能
 // @author ygw
 type AccountPool struct {
-	accounts        []*models.Account // 缓存的账号列表
-	mu              sync.RWMutex      // 读写锁
-	lastRefresh     time.Time         // 上次刷新时间
-	refreshInterval time.Duration     // 刷新间隔
-	db              *database.DB      // 数据库连接
-	cfg             accountPoolConfig // 配置
-	refreshing      atomic.Bool       // 是否正在刷新
-	roundRobinIndex uint32            // 轮询索引（用于 round_robin 模式）
-	lastUsedTime    sync.Map          // 账号最后使用时间 map[string]time.Time（用于 cooldown 模式）
-	rpmStates       sync.Map          // 账号 RPM 状态 map[string]*rpmAccountState（用于 rpm 模式）
+	accounts          []*models.Account // 缓存的账号列表
+	mu                sync.RWMutex      // 读写锁
+	lastRefresh       time.Time         // 上次刷新时间
+	refreshInterval   time.Duration     // 刷新间隔
+	db                *database.DB      // 数据库连接
+	cfg               accountPoolConfig // 配置
+	refreshing        atomic.Bool       // 是否正在刷新
+	roundRobinIndex   uint32            // 轮询索引（用于 round_robin 模式）
+	lastUsedTime      sync.Map          // 账号最后使用时间 map[string]time.Time（用于 cooldown 模式，按选号时刻计冷却）
+	cooldownReleaseAt sync.Map          // 账号请求完成后强制冷却到的时间 map[string]time.Time（用于 cooldown 模式，与 lastUsedTime 取 max）
+	rpmStates         sync.Map          // 账号 RPM 状态 map[string]*rpmAccountState（用于 rpm 模式）
 }
 
 // RPM 模式相关常量
@@ -34,6 +35,9 @@ const (
 	rpmAccountReleaseCooldown = 5 * time.Second
 	// rpmAccountInFlightTimeout in-flight 状态的兜底超时，超过则强制释放（防止泄漏）
 	rpmAccountInFlightTimeout = 3 * time.Minute
+	// cooldownPostRequestForced cooldown 模式下请求完成后强制额外冷却时长
+	// 与 cooldownSeconds 取 max，避免「长请求结束后立刻被再次选中」
+	cooldownPostRequestForced = 5 * time.Second
 )
 
 // rpmAccountState 单个账号的 RPM 调度状态
@@ -383,7 +387,13 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 	for _, acc := range accounts {
 		if lastUsed, ok := p.lastUsedTime.Load(acc.ID); ok {
 			if now.Sub(lastUsed.(time.Time)) < cooldownDuration {
-				continue // 仍在冷却中，跳过
+				continue // 仍在选号时刻冷却中，跳过
+			}
+		}
+		// 请求完成后的强制冷却：兜底「请求耗时已超过 cooldownSeconds」时账号能立即被再次选中
+		if relAt, ok := p.cooldownReleaseAt.Load(acc.ID); ok {
+			if now.Before(relAt.(time.Time)) {
+				continue
 			}
 		}
 		available = append(available, acc)
@@ -567,6 +577,25 @@ func (p *AccountPool) ReleaseRPM(accountID string, failed bool) {
 		st.releaseAt = newReleaseAt
 	}
 	st.mu.Unlock()
+}
+
+// ReleaseCooldown 标记账号请求已完成，启动「完成后强制 cooldownPostRequestForced」冷却
+// 仅 cooldown 模式下生效；其它模式无副作用。多次调用幂等且不会降级（取 max）
+// 与 selectCooldown 的 lastUsedTime+cooldownSeconds 一起取 max 决定下次可选时间
+func (p *AccountPool) ReleaseCooldown(accountID string) {
+	p.mu.RLock()
+	mode := p.cfg.selectionMode
+	p.mu.RUnlock()
+	if mode != models.AccountSelectionCooldown {
+		return
+	}
+	newReleaseAt := time.Now().Add(cooldownPostRequestForced)
+	if existing, ok := p.cooldownReleaseAt.Load(accountID); ok {
+		if !newReleaseAt.After(existing.(time.Time)) {
+			return
+		}
+	}
+	p.cooldownReleaseAt.Store(accountID, newReleaseAt)
 }
 
 // GetAccountExcluding 获取一个账号，排除指定的账号 ID

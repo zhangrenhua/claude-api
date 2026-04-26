@@ -2,13 +2,6 @@ package api
 
 import (
 	"bufio"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
 	"claude-api/internal/amazonq"
 	"claude-api/internal/auth"
 	"claude-api/internal/cache"
@@ -20,6 +13,13 @@ import (
 	"claude-api/internal/stream"
 	"claude-api/internal/sync"
 	"claude-api/internal/tokenizer"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -515,10 +515,10 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 			"pageSize": pagination.PageSize,
 			"pages":    pagination.Pages,
 		},
-		"quotaStats":           quotaStatsResponse,                 // 总配额统计 @author ygw
-		"accountStats":         accountStatsResponse,               // 账号统计 @author ygw
-		"statusStats":          statusStatsResponse,                // 各状态数量统计 @author ygw
-		"accountSelectionMode": s.accountPool.GetSelectionMode(),   // 让前端知道是否需要展示 RPM 状态列
+		"quotaStats":           quotaStatsResponse,               // 总配额统计 @author ygw
+		"accountStats":         accountStatsResponse,             // 账号统计 @author ygw
+		"statusStats":          statusStatsResponse,              // 各状态数量统计 @author ygw
+		"accountSelectionMode": s.accountPool.GetSelectionMode(), // 让前端知道是否需要展示 RPM 状态列
 	})
 }
 
@@ -1855,23 +1855,23 @@ func (s *Server) handleGetSettings(c *gin.Context) {
 
 	logger.Info("成功获取系统设置")
 	c.JSON(200, gin.H{
-		"adminPassword":                  settings.AdminPassword,
-		"apiKey":                         settings.APIKey,
-		"debugLog":                       settings.DebugLog,
-		"enableRequestLog":               settings.EnableRequestLog,
-		"logRetentionDays":               settings.LogRetentionDays,
-		"enableIPRateLimit":              settings.EnableIPRateLimit,
-		"ipRateLimitWindow":              settings.IPRateLimitWindow,
-		"ipRateLimitMax":                 settings.IPRateLimitMax,
-		"blockedIPs":                     settings.BlockedIPs,
-		"maxErrorCount":                  settings.MaxErrorCount,
-		"port":                           settings.Port,
-		"layoutFullWidth":                settings.LayoutFullWidth,
-		"accountSelectionMode":           settings.AccountSelectionMode,
-		"accountCooldownSeconds":         settings.AccountCooldownSeconds,
-		"accountRPMLimit":                settings.AccountRPMLimit,
+		"adminPassword":                    settings.AdminPassword,
+		"apiKey":                           settings.APIKey,
+		"debugLog":                         settings.DebugLog,
+		"enableRequestLog":                 settings.EnableRequestLog,
+		"logRetentionDays":                 settings.LogRetentionDays,
+		"enableIPRateLimit":                settings.EnableIPRateLimit,
+		"ipRateLimitWindow":                settings.IPRateLimitWindow,
+		"ipRateLimitMax":                   settings.IPRateLimitMax,
+		"blockedIPs":                       settings.BlockedIPs,
+		"maxErrorCount":                    settings.MaxErrorCount,
+		"port":                             settings.Port,
+		"layoutFullWidth":                  settings.LayoutFullWidth,
+		"accountSelectionMode":             settings.AccountSelectionMode,
+		"accountCooldownSeconds":           settings.AccountCooldownSeconds,
+		"accountRPMLimit":                  settings.AccountRPMLimit,
 		"accountRPMFailureCooldownSeconds": settings.AccountRPMFailureCooldownSeconds,
-		"supportedAccountSelectionModes": models.SupportedAccountSelectionModes,
+		"supportedAccountSelectionModes":   models.SupportedAccountSelectionModes,
 		// 代理配置
 		"httpProxy": settings.HTTPProxy,
 		// 智能压缩配置
@@ -1995,7 +1995,6 @@ func (s *Server) handleUpdateSettings(c *gin.Context) {
 
 	c.JSON(200, settings)
 }
-
 
 // handleClaudeMessages 处理 Claude Messages API 端点
 func (s *Server) handleClaudeMessages(c *gin.Context) {
@@ -2465,8 +2464,9 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		triedIDs = append(triedIDs, acc.ID)
 		// 兜底释放：覆盖所有提前 return/continue 路径
 		// 传 failed=false 仅作"成功冷却"兜底；若此账号实际失败过，QueueStatsUpdate 已先触发 90s 冷却
-		// ReleaseRPM 内部用 max() 保证更长冷却不被降级
+		// ReleaseRPM 内部用 max() 保证更长冷却不被降级；ReleaseCooldown 仅 cooldown 模式生效
 		defer s.accountPool.ReleaseRPM(acc.ID, false)
+		defer s.accountPool.ReleaseCooldown(acc.ID)
 
 		// 被动刷新策略：确保账号可用（刷新令牌和配额）
 		// 执行流程：检查令牌 -> 刷新配额 -> 配额错误时刷新令牌 -> 重试
@@ -2947,12 +2947,12 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		"content":         content,
 		"stop_reason":     stopReason,
 		"conversation_id": conversationID,
-		"conversationId": conversationID,
+		"conversationId":  conversationID,
 		"usage": map[string]interface{}{
-			"input_tokens":                 cacheInfo.InputTokens,
-			"output_tokens":                outputTokens,
-			"cache_creation_input_tokens":  cacheInfo.CacheCreationInputTokens,
-			"cache_read_input_tokens":      cacheInfo.CacheReadInputTokens,
+			"input_tokens":                cacheInfo.InputTokens,
+			"output_tokens":               outputTokens,
+			"cache_creation_input_tokens": cacheInfo.CacheCreationInputTokens,
+			"cache_read_input_tokens":     cacheInfo.CacheReadInputTokens,
 		},
 	}
 
@@ -3998,6 +3998,7 @@ func (s *Server) handleConsoleChatTest(c *gin.Context) {
 	c.Set("account", account)
 	// 兜底释放：保证 handler 内部任何提前 return 路径下账号都被释放（不会降级失败长冷却）
 	defer s.accountPool.ReleaseRPM(account.ID, false)
+	defer s.accountPool.ReleaseCooldown(account.ID)
 	s.handleChatCompletions(c)
 }
 
@@ -5617,4 +5618,3 @@ func (s *Server) handleToggleProxy(c *gin.Context) {
 // 		}
 // 	}
 // }
-

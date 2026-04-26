@@ -1,10 +1,6 @@
 package api
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
 	"claude-api/internal/amazonq"
 	"claude-api/internal/auth"
 	"claude-api/internal/cache"
@@ -16,6 +12,10 @@ import (
 	"claude-api/internal/proxy"
 	"claude-api/internal/ratelimit"
 	syncpkg "claude-api/internal/sync"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -970,9 +970,10 @@ func (s *Server) requireAccount(c *gin.Context) {
 
 	// 将账号存储在上下文中
 	c.Set("account", account)
-	// 兜底释放：handler 内部任何路径若漏调 QueueStatsUpdate，仍能保证 RPM 模式下账号被释放
+	// 兜底释放：handler 内部任何路径若漏调 QueueStatsUpdate，仍能保证 RPM/cooldown 模式下账号被释放
 	// 传 failed=false 仅作兜底；若实际失败 QueueStatsUpdate 已先触发 90s 冷却（max() 不会降级）
 	defer s.accountPool.ReleaseRPM(account.ID, false)
+	defer s.accountPool.ReleaseCooldown(account.ID)
 	c.Next()
 }
 
@@ -1057,7 +1058,6 @@ func (s *Server) requireAdmin(c *gin.Context) {
 
 	c.Next()
 }
-
 
 // requireTestModePassword 中间件：测试模式下敏感操作需要密码验证
 // 当 config.json 中 test=true 时，敏感操作需要提供正确的密码
@@ -1634,15 +1634,17 @@ func (s *Server) dbWriteWorker(workerID int) {
 }
 
 // QueueStatsUpdate 将统计更新加入队列
-// 同时释放 RPM 模式下的账号 in-flight 占用并启动冷却（成功失败均释放）
+// 同时释放 RPM / cooldown 模式下的账号占用并启动冷却（成功失败均释放）
 func (s *Server) QueueStatsUpdate(accountID string, success bool) {
 	if s.closing.Load() {
 		return // 服务器正在关闭，忽略更新
 	}
-	// 释放 RPM 模式下的占用（仅 rpm 模式有状态，其它模式为空操作）
-	// 失败请求触发 90s 冷却，成功请求触发 5s 冷却
+	// 释放账号池侧的占用（按当前模式分别处理；非对应模式为空操作）
+	// RPM：失败请求触发 90s 冷却，成功请求触发 5s 冷却
+	// cooldown：请求完成后强制 cooldownPostRequestForced 冷却
 	if s.accountPool != nil {
 		s.accountPool.ReleaseRPM(accountID, !success)
+		s.accountPool.ReleaseCooldown(accountID)
 	}
 	select {
 	case s.dbWriteChan <- dbWriteOp{opType: "stats", data: statsUpdate{accountID: accountID, success: success}}:
@@ -2031,7 +2033,6 @@ func (s *Server) syncRemoteAnnouncement(ctx context.Context) {
 	}
 }
 
-
 // truncateString 截断字符串，用于日志显示
 // @author ygw
 func truncateString(s string, maxLen int) string {
@@ -2138,13 +2139,13 @@ func (s *Server) RefreshAccountQuota(ctx context.Context, account *models.Accoun
 // @author ygw - 被动刷新策略
 func (s *Server) RefreshAccountTokenAndRetry(ctx context.Context, account *models.Account) error {
 	logger.Info("[被动刷新] 开始刷新账号 %s 的令牌", account.ID)
-	
+
 	err := s.refreshAccountToken(ctx, account.ID)
 	if err != nil {
 		logger.Warn("[被动刷新] 账号 %s 令牌刷新失败: %v", account.ID, err)
 		return err
 	}
-	
+
 	logger.Info("[被动刷新] 账号 %s 令牌刷新成功", account.ID)
 	return nil
 }
@@ -2190,7 +2191,7 @@ func (s *Server) EnsureAccountReady(ctx context.Context, account *models.Account
 
 	elapsed := time.Since(startTime)
 	logger.Debug("[被动刷新] 账号 %s 检查完成，耗时: %.0fms", account.ID, elapsed.Seconds()*1000)
-	
+
 	return account, nil
 }
 
