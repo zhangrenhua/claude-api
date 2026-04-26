@@ -292,6 +292,11 @@ export const settingsMixin = {
                 if (result === null) return; // 用户取消
                 
                 await this.handleLoadSettings(); // 保存后立即刷新，确保后端值生效
+                // 账号选择方式 / RPM 等设置会影响账号列表展示（如 RPM 列），
+                // 如果账号 tab 已经加载过，刷新一次让 currentSelectionMode 等同步
+                if (this.loadedTabs && this.loadedTabs.has('accounts') && typeof this.handleLoadAccounts === 'function') {
+                    await this.handleLoadAccounts();
+                }
                 localStorage.setItem('layoutFullWidth', String(this.settingsData.layoutFullWidth));
                 showToast(this, '配置已保存', 'success');
 

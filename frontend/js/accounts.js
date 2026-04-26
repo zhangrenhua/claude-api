@@ -2139,6 +2139,11 @@ export const accountsMixin = {
         }
     },
 
+    // 组件挂载后启动 RPM 客户端 ticker（无论当前模式，cost 极低；列由 v-if 控制是否渲染）
+    mounted() {
+        this.startRPMTicker();
+    },
+
     // 组件销毁时清理定时器
     beforeUnmount() {
         // 清理 OAuth 轮询定时器
@@ -2151,5 +2156,7 @@ export const accountsMixin = {
             clearInterval(this.accountLogsRefreshTimer);
             this.accountLogsRefreshTimer = null;
         }
+        // 清理 RPM ticker
+        this.stopRPMTicker();
     }
 };
