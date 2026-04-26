@@ -119,6 +119,10 @@ var downstreamToUpstreamModel = map[string]string{
 	"gpt-5.4":                    "claude-sonnet-4-5-20250929",
 	"gpt-5.4-mini":               "claude-sonnet-4-20250514",
 	"gpt-5.4-thinking":           "claude-sonnet-4-5-20250929",
+	"gpt-5.5":                    "claude-sonnet-4-5-20250929",
+	"gpt-5.5-codex":              "claude-sonnet-4-5-20250929",
+	"gpt-5.5-mini":               "claude-sonnet-4-20250514",
+	"gpt-5.5-thinking":           "claude-sonnet-4-5-20250929",
 }
 
 // MapDownstreamModel 把下游请求模型名翻译为上游模型名
