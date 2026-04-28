@@ -26,6 +26,7 @@ type AccountPool struct {
 	roundRobinIndex   uint32            // 轮询索引（用于 round_robin 模式）
 	lastUsedTime      sync.Map          // 账号最后使用时间 map[string]time.Time（用于 cooldown 模式，按选号时刻计冷却）
 	cooldownReleaseAt sync.Map          // 账号请求完成后强制冷却到的时间 map[string]time.Time（用于 cooldown 模式，与 lastUsedTime 取 max）
+	cooldownInFlight  sync.Map          // 账号当前正在处理请求的开始时间 map[string]time.Time（用于 cooldown 模式，in-flight 期间不可被再次选中）
 	rpmStates         sync.Map          // 账号 RPM 状态 map[string]*rpmAccountState（用于 rpm 模式）
 }
 
@@ -38,6 +39,8 @@ const (
 	// cooldownPostRequestForced cooldown 模式下请求完成后强制额外冷却时长
 	// 与 cooldownSeconds 取 max，避免「长请求结束后立刻被再次选中」
 	cooldownPostRequestForced = 5 * time.Second
+	// cooldownInFlightTimeout cooldown 模式 in-flight 状态的兜底超时，超过则强制释放（防止状态泄漏）
+	cooldownInFlightTimeout = 3 * time.Minute
 )
 
 // rpmAccountState 单个账号的 RPM 调度状态
@@ -373,9 +376,9 @@ func (p *AccountPool) selectWeightedRandom(accounts []*models.Account) *models.A
 }
 
 // selectCooldown 冷却时间选择账号
-// 过滤掉处于冷却期内的账号，从可用账号中按轮询方式选择
-// 所有账号都在冷却中时返回 nil，由上层返回错误提示
-// 选中后立即标记使用时间，确保后续请求不会在冷却期内重复选中同一账号
+// 过滤掉处于冷却期或 in-flight 中的账号，从可用账号中按轮询方式选择
+// 所有账号都不可用时返回 nil，由上层返回错误提示
+// 通过 LoadOrStore 原子地占用 in-flight 标记，防止并发请求选中同一账号
 func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account {
 	p.mu.RLock()
 	cooldownDuration := time.Duration(p.cfg.cooldownSeconds) * time.Second
@@ -385,6 +388,16 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 	var available []*models.Account
 
 	for _, acc := range accounts {
+		// in-flight 检查：账号正在处理请求时不可被再次选中
+		// 兜底：超过最大持续时间视为状态泄漏，强制释放
+		if claimedAtV, ok := p.cooldownInFlight.Load(acc.ID); ok {
+			if now.Sub(claimedAtV.(time.Time)) > cooldownInFlightTimeout {
+				logger.Warn("[账号池] cooldown 模式: 账号 %s in-flight 持续 %s 已超限，强制释放", acc.ID, cooldownInFlightTimeout)
+				p.cooldownInFlight.Delete(acc.ID)
+			} else {
+				continue // 仍在处理中，跳过
+			}
+		}
 		if lastUsed, ok := p.lastUsedTime.Load(acc.ID); ok {
 			if now.Sub(lastUsed.(time.Time)) < cooldownDuration {
 				continue // 仍在选号时刻冷却中，跳过
@@ -400,18 +413,26 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 	}
 
 	if len(available) == 0 {
-		// 所有账号都在冷却中，返回 nil 拒绝请求
-		logger.Debug("[账号池] 冷却模式: 所有 %d 个账号均在冷却期内（%ds），拒绝调度", len(accounts), p.cfg.cooldownSeconds)
+		// 所有账号都在冷却中或处理中，返回 nil 拒绝请求
+		logger.Debug("[账号池] 冷却模式: 所有 %d 个账号均在冷却期内或处理中（%ds），拒绝调度", len(accounts), p.cfg.cooldownSeconds)
 		return nil
 	}
 
-	// 从可用账号中轮询选择
-	idx := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
-	selected := available[idx%uint32(len(available))]
+	// 从可用账号中按轮询顺序尝试占用 in-flight；被并发抢占的跳过试下一个
+	n := uint32(len(available))
+	start := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
+	for i := uint32(0); i < n; i++ {
+		candidate := available[(start+i)%n]
+		claimedAt := time.Now()
+		if _, loaded := p.cooldownInFlight.LoadOrStore(candidate.ID, claimedAt); loaded {
+			continue // 被并发请求抢占，尝试下一个
+		}
+		p.lastUsedTime.Store(candidate.ID, claimedAt)
+		return candidate
+	}
 
-	// 选中后立即标记使用时间，防止并发请求重复选中
-	p.lastUsedTime.Store(selected.ID, time.Now())
-	return selected
+	logger.Debug("[账号池] 冷却模式: 所有可用账号均被并发抢占，拒绝调度")
+	return nil
 }
 
 // NotifyUsed 通知账号已被使用（记录使用时间，用于 cooldown 模式）
@@ -579,7 +600,7 @@ func (p *AccountPool) ReleaseRPM(accountID string, failed bool) {
 	st.mu.Unlock()
 }
 
-// ReleaseCooldown 标记账号请求已完成，启动「完成后强制 cooldownPostRequestForced」冷却
+// ReleaseCooldown 标记账号请求已完成，清除 in-flight 标记并启动「完成后强制 cooldownPostRequestForced」冷却
 // 仅 cooldown 模式下生效；其它模式无副作用。多次调用幂等且不会降级（取 max）
 // 与 selectCooldown 的 lastUsedTime+cooldownSeconds 一起取 max 决定下次可选时间
 func (p *AccountPool) ReleaseCooldown(accountID string) {
@@ -589,6 +610,8 @@ func (p *AccountPool) ReleaseCooldown(accountID string) {
 	if mode != models.AccountSelectionCooldown {
 		return
 	}
+	// 清除 in-flight 占用，账号可被后续请求选中（仍受 cooldownSeconds + 5s 兜底约束）
+	p.cooldownInFlight.Delete(accountID)
 	newReleaseAt := time.Now().Add(cooldownPostRequestForced)
 	if existing, ok := p.cooldownReleaseAt.Load(accountID); ok {
 		if !newReleaseAt.After(existing.(time.Time)) {
