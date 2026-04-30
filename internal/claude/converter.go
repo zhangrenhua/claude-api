@@ -39,7 +39,6 @@ const (
 // 有效的模型名称集合
 var validModels = map[string]bool{
 	"auto":              true,
-	"claude-sonnet-4":   true,
 	"claude-sonnet-4.5": true,
 	"claude-haiku-4.5":  true,
 	"claude-opus-4.5":   true,
@@ -47,7 +46,8 @@ var validModels = map[string]bool{
 
 // 规范模型名称到短名称的映射
 var canonicalToShort = map[string]string{
-	"claude-sonnet-4-20250514":   "claude-sonnet-4",
+	"claude-sonnet-4":            "claude-sonnet-4.5",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4.5",
 	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
 	"claude-sonnet-4-5":          "claude-sonnet-4.5",
 	"claude-haiku-4-5-20251001":  "claude-haiku-4.5",
@@ -83,14 +83,7 @@ func MapModelName(claudeModel string) string {
 var downstreamToUpstreamModel = map[string]string{
 	"claud 4.6":                  "claude-sonnet-4-5-20250929",
 	"claude opus 4.6":            "claude-sonnet-4-5-20250929",
-	"claude-3-5-haiku-20241022":  "claude-3-5-haiku-20241022",
-	"claude-3-5-sonnet-20241022": "claude-haiku-4-5-20251001",
-	"claude-3-7-sonnet-20250219": "claude-haiku-4-5-20251001",
-	"claude-3-haiku-20240307":    "claude-3-haiku-20240307",
-	"claude-3-sonnet-20240229":   "claude-3-sonnet-20240229",
-	"claude-haiku-4-20250514":    "claude-haiku-4-20250514",
 	"claude-haiku-4-5":           "claude-haiku-4-5-20251001",
-	"claude-haiku-4-5-2025100":   "claude-haiku-4-5-20251001",
 	"claude-haiku-4-5-20251001":  "claude-haiku-4-5-20251001",
 	"claude-opus-4-20250514":     "claude-sonnet-4-20250514",
 	"claude-opus-4-5":            "claude-sonnet-4-5-20250929",
