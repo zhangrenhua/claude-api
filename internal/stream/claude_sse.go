@@ -12,7 +12,131 @@ import (
 const (
 	ThinkingStartTag = "<thinking>"
 	ThinkingEndTag   = "</thinking>"
+	// thinkingEndTagPlusNewlines </thinking>\n\n 的总长度，用作流式 buffer 末尾保留长度
+	thinkingEndTagPlusNewlines = len(ThinkingEndTag) + 2 // 13
 )
+
+// quoteCharSet 与 kiro.rs QUOTE_CHARS 对齐
+// 当 thinking 标签被这些字符包裹时，认为是被引用而非真正的标签（28 个字符）
+var quoteCharSet = func() [256]bool {
+	var s [256]bool
+	for _, c := range []byte{
+		'`', '"', '\'', '\\', '#', '!', '@', '$', '%', '^', '&', '*',
+		'(', ')', '-', '_', '=', '+', '[', ']', '{', '}', ';', ':',
+		'<', '>', ',', '.', '?', '/',
+	} {
+		s[c] = true
+	}
+	return s
+}()
+
+// isQuoteChar 判定 buffer 第 pos 字节是否是引用字符（越界返回 false）
+func isQuoteChar(buffer string, pos int) bool {
+	if pos < 0 || pos >= len(buffer) {
+		return false
+	}
+	return quoteCharSet[buffer[pos]]
+}
+
+// findCharBoundary 找到 ≤ target 的最近 UTF-8 字符边界，避免切到多字节字符中间
+// 与 kiro.rs find_char_boundary 对齐
+func findCharBoundary(s string, target int) int {
+	if target >= len(s) {
+		return len(s)
+	}
+	if target <= 0 {
+		return 0
+	}
+	pos := target
+	// UTF-8 续字节为 10xxxxxx（0x80~0xBF），向前回退到首字节
+	for pos > 0 && (s[pos]&0xC0) == 0x80 {
+		pos--
+	}
+	return pos
+}
+
+// findRealThinkingStartTag 找到不被引用字符包裹的 <thinking> 起始位置；找不到返回 -1
+func findRealThinkingStartTag(buffer string) int {
+	const tag = ThinkingStartTag
+	searchStart := 0
+	for {
+		idx := strings.Index(buffer[searchStart:], tag)
+		if idx == -1 {
+			return -1
+		}
+		absPos := searchStart + idx
+		if absPos > 0 && isQuoteChar(buffer, absPos-1) {
+			searchStart = absPos + 1
+			continue
+		}
+		if isQuoteChar(buffer, absPos+len(tag)) {
+			searchStart = absPos + 1
+			continue
+		}
+		return absPos
+	}
+}
+
+// findRealThinkingEndTag 找到不被引用字符包裹、且后面紧跟 \n\n 的 </thinking> 起始位置
+// 流式语境严格要求 \n\n 后缀，避免把 thinking 内容里提到的 </thinking> 字符串误判为结束标签
+// 找不到 / 等待更多内容返回 -1
+func findRealThinkingEndTag(buffer string) int {
+	const tag = ThinkingEndTag
+	searchStart := 0
+	for {
+		idx := strings.Index(buffer[searchStart:], tag)
+		if idx == -1 {
+			return -1
+		}
+		absPos := searchStart + idx
+		if absPos > 0 && isQuoteChar(buffer, absPos-1) {
+			searchStart = absPos + 1
+			continue
+		}
+		afterPos := absPos + len(tag)
+		if isQuoteChar(buffer, afterPos) {
+			searchStart = absPos + 1
+			continue
+		}
+		afterContent := buffer[afterPos:]
+		// \n\n 还没到达，等待下一个 chunk
+		if len(afterContent) < 2 {
+			return -1
+		}
+		if strings.HasPrefix(afterContent, "\n\n") {
+			return absPos
+		}
+		searchStart = absPos + 1
+	}
+}
+
+// findRealThinkingEndTagAtBufferEnd 找到 buffer 末尾的 </thinking>（标签后全是空白字符）
+// 用于"边界事件"场景：thinking 后立刻进入 tool_use、流结束等，此时可能没有 \n\n
+// 仅当标签后剩余内容全是空白时才认定，避免把 thinking 内容里的 </thinking> 误判
+func findRealThinkingEndTagAtBufferEnd(buffer string) int {
+	const tag = ThinkingEndTag
+	searchStart := 0
+	for {
+		idx := strings.Index(buffer[searchStart:], tag)
+		if idx == -1 {
+			return -1
+		}
+		absPos := searchStart + idx
+		if absPos > 0 && isQuoteChar(buffer, absPos-1) {
+			searchStart = absPos + 1
+			continue
+		}
+		afterPos := absPos + len(tag)
+		if isQuoteChar(buffer, afterPos) {
+			searchStart = absPos + 1
+			continue
+		}
+		if strings.TrimSpace(buffer[afterPos:]) == "" {
+			return absPos
+		}
+		searchStart = absPos + 1
+	}
+}
 
 // ReplaceBrandingWithModel 对文本做品牌名和模型名替换（忽略大小写）
 // 把 Kiro 与上游可能返回的 Claude 模型名一律替换为下游请求时传入的 modelName
@@ -231,10 +355,21 @@ func sseFormat(eventType string, data interface{}) string {
 	return fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, string(jsonData))
 }
 
+// InflateTokenCount 把 token 数按 +5% 上浮（仅用于客户端响应中的 input/output token 字段）
+// 内部 c.Set / 日志 / 数据库统计保留原始值，仅在写入下游响应体时调用本函数
+// 整数四舍五入（half-up），与 1.05 倍浮点结果保持一致；非正值原样返回避免 0 被放大成 1
+func InflateTokenCount(t int) int {
+	if t <= 0 {
+		return t
+	}
+	return (t*21 + 10) / 20
+}
+
 // BuildMessageStart 构建 message_start 事件
 // cacheTokens 可选：[0]=cache_creation_input_tokens, [1]=cache_read_input_tokens
+// input_tokens 在写入响应前 +5% 上浮；cache_*_input_tokens 是独立计费维度，保持原值
 func BuildMessageStart(conversationID, model string, inputTokens int, cacheTokens ...int) string {
-	usage := map[string]int{"input_tokens": inputTokens, "output_tokens": 0}
+	usage := map[string]int{"input_tokens": InflateTokenCount(inputTokens), "output_tokens": 0}
 	if len(cacheTokens) >= 2 {
 		usage["cache_creation_input_tokens"] = cacheTokens[0]
 		usage["cache_read_input_tokens"] = cacheTokens[1]
@@ -306,6 +441,7 @@ func BuildPing() string {
 }
 
 // BuildMessageStop 构建 message_delta 和 message_stop 事件
+// output_tokens 在写入响应前 +5% 上浮
 func BuildMessageStop(inputTokens, outputTokens int, stopReason string) string {
 	if stopReason == "" {
 		stopReason = "end_turn"
@@ -313,7 +449,7 @@ func BuildMessageStop(inputTokens, outputTokens int, stopReason string) string {
 	deltaData := map[string]interface{}{
 		"type":  "message_delta",
 		"delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]int{"output_tokens": outputTokens},
+		"usage": map[string]int{"output_tokens": InflateTokenCount(outputTokens)},
 	}
 	stopData := map[string]interface{}{"type": "message_stop"}
 	return sseFormat("message_delta", deltaData) + sseFormat("message_stop", stopData)
@@ -381,9 +517,9 @@ type ClaudeStreamHandler struct {
 	ProcessedToolUseIDs   map[string]bool
 	AllToolInputs         []string
 	// thinking 块状态
-	InThinkBlock         bool
-	ThinkBuffer          string
-	PendingStartTagChars int
+	InThinkBlock                bool
+	ThinkBuffer                 string
+	StripThinkingLeadingNewline bool // <thinking> 后紧跟的 \n 需被剥离（可能跨 chunk 到达）
 	// token 计数（基于流式 delta 事件，更准确）
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	OutputDeltaCount int
@@ -515,6 +651,10 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 			if h.ProcessedToolUseIDs[toolUseID] {
 				break
 			}
+
+			// 边界事件：thinking 直接进入 tool_use 时，</thinking> 后可能没有 \n\n
+			// 此时需要按"buffer 末尾全空白"的规则刷出 thinking 块，避免遗留
+			events = append(events, h.flushThinkBufferAtEnd()...)
 
 			// 关闭之前的文本块
 			if h.ContentBlockStartSent && !h.ContentBlockStopSent {
@@ -651,135 +791,170 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 }
 
 // processThinkBuffer 处理 think 缓冲区，检测 thinking 标签
+// 与 kiro.rs process_content_with_thinking 对齐：
+//   - 28 字符引用前后缀过滤，避免把内容里提到的 <thinking>/</thinking> 误判
+//   - </thinking> 严格要求后跟 \n\n（流式语境）
+//   - <thinking> 前的纯空白前缀不发出，避免在 thinking 块前生成空 text 块
+//   - <thinking> 后紧跟的 \n 跨 chunk 剥离（StripThinkingLeadingNewline 标志位）
+//   - 找不到 end tag 时保留末尾 13 字节（</thinking>\n\n 长度）防止部分标签被错误发出
+//   - findCharBoundary 保证 UTF-8 多字节字符不被切断
 func (h *ClaudeStreamHandler) processThinkBuffer() []string {
 	var events []string
 
 	for h.ThinkBuffer != "" {
-		// 处理待定的开始标签字符
-		if h.PendingStartTagChars > 0 {
-			if len(h.ThinkBuffer) < h.PendingStartTagChars {
-				h.PendingStartTagChars -= len(h.ThinkBuffer)
-				h.ThinkBuffer = ""
-				break
-			} else {
-				h.ThinkBuffer = h.ThinkBuffer[h.PendingStartTagChars:]
-				h.PendingStartTagChars = 0
-				if h.ThinkBuffer == "" {
-					break
-				}
-				continue
-			}
-		}
-
 		if !h.InThinkBlock {
-			// 查找 thinking 开始标签
-			thinkStart := strings.Index(h.ThinkBuffer, ThinkingStartTag)
-			if thinkStart == -1 {
-				// 没有找到完整标签，检查是否有部分匹配
-				pending := pendingTagSuffix(h.ThinkBuffer, ThinkingStartTag)
-				if pending == len(h.ThinkBuffer) && pending > 0 {
-					// 整个缓冲区是标签前缀，等待更多数据
-					// 但如果当前是文本块，需要先关闭它
-					if h.ContentBlockStartSent && !h.ContentBlockStopSent {
-						events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
-						h.ContentBlockStopSent = true
-						h.ContentBlockStartSent = false
+			startPos := findRealThinkingStartTag(h.ThinkBuffer)
+			if startPos == -1 {
+				// 没找到 <thinking>：保留末尾 len(<thinking>)=10 字节防止跨 chunk 部分标签
+				target := len(h.ThinkBuffer) - len(ThinkingStartTag)
+				if target < 0 {
+					target = 0
+				}
+				safeLen := findCharBoundary(h.ThinkBuffer, target)
+				if safeLen > 0 {
+					safeContent := h.ThinkBuffer[:safeLen]
+					// 纯空白前缀且 thinking 还没出现 → 暂不发出，留在 buffer 等更多内容
+					// 避免在 thinking 块前先创建空 text 块导致客户端解析错乱
+					if strings.TrimSpace(safeContent) != "" {
+						events = append(events, h.emitTextDelta(safeContent)...)
+						h.ThinkBuffer = h.ThinkBuffer[safeLen:]
 					}
-
-					// 开始 thinking 块
-					h.ContentBlockIndex++
-					events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "thinking"))
-					h.ContentBlockStartSent = true
-					h.ContentBlockStarted = true
-					h.ContentBlockStopSent = false
-					h.InThinkBlock = true
-					h.PendingStartTagChars = len(ThinkingStartTag) - pending
-					h.ThinkBuffer = ""
-					break
 				}
-
-				// 发送非标签前缀部分作为文本
-				emitLen := len(h.ThinkBuffer) - pending
-				if emitLen <= 0 {
-					break
-				}
-				textChunk := h.ThinkBuffer[:emitLen]
-				if textChunk != "" {
-					if !h.ContentBlockStartSent {
-						h.ContentBlockIndex++
-						events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "text"))
-						h.ContentBlockStartSent = true
-						h.ContentBlockStarted = true
-						h.ContentBlockStopSent = false
-					}
-					h.ResponseBuffer = append(h.ResponseBuffer, textChunk)
-					events = append(events, BuildContentBlockDelta(h.ContentBlockIndex, textChunk))
-				}
-				h.ThinkBuffer = h.ThinkBuffer[emitLen:]
-			} else {
-				// 找到开始标签
-				beforeText := h.ThinkBuffer[:thinkStart]
-				if beforeText != "" {
-					if !h.ContentBlockStartSent {
-						h.ContentBlockIndex++
-						events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "text"))
-						h.ContentBlockStartSent = true
-						h.ContentBlockStarted = true
-						h.ContentBlockStopSent = false
-					}
-					h.ResponseBuffer = append(h.ResponseBuffer, beforeText)
-					events = append(events, BuildContentBlockDelta(h.ContentBlockIndex, beforeText))
-				}
-				h.ThinkBuffer = h.ThinkBuffer[thinkStart+len(ThinkingStartTag):]
-
-				// 关闭当前文本块
-				if h.ContentBlockStartSent && !h.ContentBlockStopSent {
-					events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
-					h.ContentBlockStopSent = true
-					h.ContentBlockStartSent = false
-				}
-
-				// 开始 thinking 块
-				h.ContentBlockIndex++
-				events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "thinking"))
-				h.ContentBlockStartSent = true
-				h.ContentBlockStarted = true
-				h.ContentBlockStopSent = false
-				h.InThinkBlock = true
-				h.PendingStartTagChars = 0
+				break
 			}
-		} else {
-			// 在 thinking 块中，查找结束标签
-			thinkEnd := strings.Index(h.ThinkBuffer, ThinkingEndTag)
-			if thinkEnd == -1 {
-				// 没有找到结束标签，检查部分匹配
-				pending := pendingTagSuffix(h.ThinkBuffer, ThinkingEndTag)
-				emitLen := len(h.ThinkBuffer) - pending
-				if emitLen <= 0 {
-					break
-				}
-				thinkingChunk := h.ThinkBuffer[:emitLen]
-				if thinkingChunk != "" {
-					events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, thinkingChunk))
-				}
-				h.ThinkBuffer = h.ThinkBuffer[emitLen:]
-			} else {
-				// 找到结束标签
-				thinkingChunk := h.ThinkBuffer[:thinkEnd]
-				if thinkingChunk != "" {
-					events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, thinkingChunk))
-				}
-				h.ThinkBuffer = h.ThinkBuffer[thinkEnd+len(ThinkingEndTag):]
 
-				// 关闭 thinking 块
+			// 找到 <thinking>：发送之前的内容（跳过纯空白前缀）
+			beforeText := h.ThinkBuffer[:startPos]
+			if strings.TrimSpace(beforeText) != "" {
+				events = append(events, h.emitTextDelta(beforeText)...)
+			}
+			h.ThinkBuffer = h.ThinkBuffer[startPos+len(ThinkingStartTag):]
+
+			// 关闭可能存在的 text 块
+			if h.ContentBlockStartSent && !h.ContentBlockStopSent {
 				events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
 				h.ContentBlockStopSent = true
 				h.ContentBlockStartSent = false
-				h.InThinkBlock = false
+			}
+
+			// 开 thinking 块
+			h.ContentBlockIndex++
+			events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "thinking"))
+			h.ContentBlockStartSent = true
+			h.ContentBlockStarted = true
+			h.ContentBlockStopSent = false
+			h.InThinkBlock = true
+			h.StripThinkingLeadingNewline = true
+			continue
+		}
+
+		// 在 thinking 块内
+		// 剥离 <thinking>\n 中的前导 \n（可能跨 chunk）
+		if h.StripThinkingLeadingNewline {
+			if strings.HasPrefix(h.ThinkBuffer, "\n") {
+				h.ThinkBuffer = h.ThinkBuffer[1:]
+				h.StripThinkingLeadingNewline = false
+			} else if h.ThinkBuffer != "" {
+				h.StripThinkingLeadingNewline = false
+			}
+			// buffer 为空则保留标志，等下一个 chunk
+			if h.ThinkBuffer == "" {
+				break
 			}
 		}
+
+		endPos := findRealThinkingEndTag(h.ThinkBuffer)
+		if endPos != -1 {
+			// 提取 thinking 内容
+			thinkingChunk := h.ThinkBuffer[:endPos]
+			if thinkingChunk != "" {
+				events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, thinkingChunk))
+			}
+
+			// 关闭 thinking 块
+			events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
+			h.ContentBlockStopSent = true
+			h.ContentBlockStartSent = false
+			h.InThinkBlock = false
+
+			// 跳过 </thinking>\n\n（findRealThinkingEndTag 已确认 \n\n 存在）
+			h.ThinkBuffer = h.ThinkBuffer[endPos+thinkingEndTagPlusNewlines:]
+			continue
+		}
+
+		// 没找到 </thinking>\n\n：保留末尾 13 字节（</thinking>\n\n 总长）防止部分标签被发出
+		target := len(h.ThinkBuffer) - thinkingEndTagPlusNewlines
+		if target < 0 {
+			target = 0
+		}
+		safeLen := findCharBoundary(h.ThinkBuffer, target)
+		if safeLen > 0 {
+			thinkingChunk := h.ThinkBuffer[:safeLen]
+			if thinkingChunk != "" {
+				events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, thinkingChunk))
+			}
+			h.ThinkBuffer = h.ThinkBuffer[safeLen:]
+		}
+		break
 	}
 
+	return events
+}
+
+// emitTextDelta 把内容作为 text_delta 发出，必要时先创建 text 块
+func (h *ClaudeStreamHandler) emitTextDelta(text string) []string {
+	var events []string
+	if !h.ContentBlockStartSent {
+		h.ContentBlockIndex++
+		events = append(events, BuildContentBlockStart(h.ContentBlockIndex, "text"))
+		h.ContentBlockStartSent = true
+		h.ContentBlockStarted = true
+		h.ContentBlockStopSent = false
+	}
+	h.ResponseBuffer = append(h.ResponseBuffer, text)
+	events = append(events, BuildContentBlockDelta(h.ContentBlockIndex, text))
+	return events
+}
+
+// flushThinkBufferAtEnd 在流结束 / 边界事件（如 thinking 直接进入 tool_use）时刷出剩余 buffer
+// 接受 </thinking> 后只有空白字符的情况（findRealThinkingEndTagAtBufferEnd），
+// 避免流尾遗漏的 thinking 块没有正确结束
+func (h *ClaudeStreamHandler) flushThinkBufferAtEnd() []string {
+	var events []string
+	if h.ThinkBuffer == "" {
+		return events
+	}
+
+	if h.InThinkBlock {
+		// 优先严格匹配（带 \n\n）
+		endPos := findRealThinkingEndTag(h.ThinkBuffer)
+		if endPos == -1 {
+			// 退而求其次：标签后只有空白
+			endPos = findRealThinkingEndTagAtBufferEnd(h.ThinkBuffer)
+		}
+		if endPos != -1 {
+			thinkingChunk := h.ThinkBuffer[:endPos]
+			if thinkingChunk != "" {
+				events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, thinkingChunk))
+			}
+			events = append(events, BuildContentBlockStop(h.ContentBlockIndex))
+			h.ContentBlockStopSent = true
+			h.ContentBlockStartSent = false
+			h.InThinkBlock = false
+			h.ThinkBuffer = ""
+		} else {
+			// 没有结束标签，把剩余作为 thinking_delta 发出（最后兜底）
+			events = append(events, BuildThinkingBlockDelta(h.ContentBlockIndex, h.ThinkBuffer))
+			h.ThinkBuffer = ""
+		}
+		return events
+	}
+
+	// 不在 thinking 块内：剩余 buffer 作为 text 发出
+	if strings.TrimSpace(h.ThinkBuffer) != "" {
+		events = append(events, h.emitTextDelta(h.ThinkBuffer)...)
+	}
+	h.ThinkBuffer = ""
 	return events
 }
 
@@ -791,6 +966,11 @@ func (h *ClaudeStreamHandler) Finish() string {
 	}
 
 	var result string
+
+	// 流尾刷出 think 缓冲区里残留的内容（接受 </thinking> 后只有空白的边界场景）
+	for _, ev := range h.flushThinkBufferAtEnd() {
+		result += ev
+	}
 
 	// 确保最后一个块已关闭
 	if h.ContentBlockStarted && !h.ContentBlockStopSent {

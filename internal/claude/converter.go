@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -29,12 +30,34 @@ func getOperatingSystem() string {
 }
 
 // thinking 模式相关常量
-// 注意：ThinkingHint 只需要一次，与 Python 参考项目 (claude-api) 保持一致
+// 与 kiro.rs 实现对齐：支持 enabled / adaptive 两种 type，并把 prefix 注入到 system 消息
 const (
-	ThinkingHint     = "<thinking_mode>interleaved</thinking_mode><max_thinking_length>16000</max_thinking_length>"
 	ThinkingStartTag = "<thinking>"
 	ThinkingEndTag   = "</thinking>"
+
+	// thinkingDefaultBudgetTokens 客户端未指定 budget_tokens 时的默认值（与 kiro.rs 一致）
+	thinkingDefaultBudgetTokens = 20000
+	// thinkingMaxBudgetTokens 上限（与 kiro.rs 的 MAX_BUDGET_TOKENS 一致）
+	thinkingMaxBudgetTokens = 24576
+	// thinkingMinBudgetTokens budget_tokens 低于此值时回落到默认（避免无效配置）
+	thinkingMinBudgetTokens = 1024
+	// thinkingDefaultEffort adaptive 模式下 effort 缺失时的默认值
+	thinkingDefaultEffort = "high"
+	// thinkingSupportedModelID 仅此 kiro ModelID 支持 thinking 模式，其它一律忽略
+	thinkingSupportedModelID = "claude-sonnet-4.5"
 )
+
+// legacyThinkingHintPattern 旧版 ThinkingHint（"interleaved" + "16000"）以及现行 enabled / adaptive
+// 标签的统一识别正则；用于历史 user 消息合并时去重，避免老数据残留双标签
+var legacyThinkingHintPattern = regexp.MustCompile(`<thinking_mode>[^<]*</thinking_mode>(<(max_thinking_length|thinking_effort)>[^<]*</(max_thinking_length|thinking_effort)>)?`)
+
+// ThinkingConfig 解析后的 thinking 配置
+type ThinkingConfig struct {
+	Enabled      bool   // 是否启用（type 为 "enabled" 或 "adaptive" 时为 true）
+	Type         string // "enabled" | "adaptive"
+	BudgetTokens int    // enabled 模式下使用，clamp 到 [1024, 24576]
+	Effort       string // adaptive 模式下使用，"low" | "medium" | "high"
+}
 
 // 有效的模型名称集合
 var validModels = map[string]bool{
@@ -125,63 +148,129 @@ func MapDownstreamModel(name string) (string, bool) {
 	return v, ok
 }
 
+// HasThinkingSuffix 检测下游模型名是否带 -thinking 后缀
+// 用于在客户端未显式传 thinking 配置时自动开启 thinking 模式
+// 大小写不敏感、忽略首尾空白
+func HasThinkingSuffix(name string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(name)), "-thinking")
+}
+
 // getCurrentTimestamp 获取当前时间戳
 func getCurrentTimestamp() string {
 	now := time.Now()
 	return now.Format("Monday, 2006-01-02T15:04:05.000-07:00")
 }
 
-// wrapThinkingContent 将 thinking 内容包装成 XML 标签
-func wrapThinkingContent(text string) string {
-	return ThinkingStartTag + text + ThinkingEndTag
-}
-
-// isThinkingModeEnabled 检测是否启用了 thinking 模式
-func isThinkingModeEnabled(thinking interface{}) bool {
-	if thinking == nil {
-		return false
+// parseThinkingConfig 解析 ClaudeRequest.Thinking 字段为强类型配置
+// 兼容多种输入：bool / string / map（含 "type"、"budget_tokens"、"enabled" 等字段）
+// outputConfig 用于 adaptive 模式下提取 effort（map 中的 "effort" 字段）
+func parseThinkingConfig(thinking interface{}, outputConfig interface{}) ThinkingConfig {
+	cfg := ThinkingConfig{
+		BudgetTokens: thinkingDefaultBudgetTokens,
+		Effort:       thinkingDefaultEffort,
 	}
+	if thinking == nil {
+		return cfg
+	}
+
+	setEnabled := func(t string) {
+		cfg.Enabled = true
+		cfg.Type = strings.ToLower(t)
+	}
+
 	switch t := thinking.(type) {
 	case bool:
-		return t
+		if t {
+			setEnabled("enabled")
+		}
 	case string:
-		return strings.ToLower(t) == "enabled"
+		s := strings.ToLower(t)
+		if s == "enabled" || s == "adaptive" {
+			setEnabled(s)
+		}
 	case map[string]interface{}:
-		// 检查 type 字段
 		if typeVal, ok := t["type"].(string); ok {
-			if strings.ToLower(typeVal) == "enabled" {
-				return true
+			tl := strings.ToLower(typeVal)
+			if tl == "enabled" || tl == "adaptive" {
+				setEnabled(tl)
 			}
 		}
-		// 检查 enabled 字段
-		if enabled, ok := t["enabled"].(bool); ok {
-			return enabled
-		}
-		// 检查 budget_tokens 字段
+		// budget_tokens 设置就视为 enabled（除非已是 adaptive）
 		if budget, ok := t["budget_tokens"].(float64); ok && budget > 0 {
-			return true
+			cfg.BudgetTokens = int(budget)
+			if !cfg.Enabled {
+				setEnabled("enabled")
+			}
+		} else if budget, ok := t["budget_tokens"].(int); ok && budget > 0 {
+			cfg.BudgetTokens = budget
+			if !cfg.Enabled {
+				setEnabled("enabled")
+			}
 		}
-		if budget, ok := t["budget_tokens"].(int); ok && budget > 0 {
-			return true
+		if enabled, ok := t["enabled"].(bool); ok && enabled && !cfg.Enabled {
+			setEnabled("enabled")
 		}
 	}
-	return false
+
+	// budget_tokens clamp
+	if cfg.BudgetTokens > thinkingMaxBudgetTokens {
+		cfg.BudgetTokens = thinkingMaxBudgetTokens
+	}
+	if cfg.BudgetTokens < thinkingMinBudgetTokens {
+		cfg.BudgetTokens = thinkingDefaultBudgetTokens
+	}
+
+	// 从 output_config 提取 effort（adaptive 模式用）
+	if oc, ok := outputConfig.(map[string]interface{}); ok {
+		if e, ok := oc["effort"].(string); ok && e != "" {
+			cfg.Effort = strings.ToLower(e)
+		}
+	}
+
+	return cfg
 }
 
-// appendThinkingHint 在文本末尾添加 thinking 提示
-func appendThinkingHint(text string) string {
-	if text == "" {
-		return ThinkingHint
+// generateThinkingPrefix 根据配置生成 system 消息前置的 thinking 标签
+// enabled  → <thinking_mode>enabled</thinking_mode><max_thinking_length>{budget}</max_thinking_length>
+// adaptive → <thinking_mode>adaptive</thinking_mode><thinking_effort>{effort}</thinking_effort>
+// 未启用返回空串
+func generateThinkingPrefix(cfg ThinkingConfig) string {
+	if !cfg.Enabled {
+		return ""
 	}
-	normalized := strings.TrimRight(text, " \t\r\n")
-	if strings.HasSuffix(normalized, ThinkingHint) {
+	if cfg.Type == "adaptive" {
+		return fmt.Sprintf("<thinking_mode>adaptive</thinking_mode><thinking_effort>%s</thinking_effort>", cfg.Effort)
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode><max_thinking_length>%d</max_thinking_length>", cfg.BudgetTokens)
+}
+
+// hasThinkingTags 检查内容中是否已含 thinking_mode / max_thinking_length / thinking_effort 标签
+// 用于 system 注入前的去重，避免上游收到重复 prefix
+func hasThinkingTags(content string) bool {
+	return strings.Contains(content, "<thinking_mode>") ||
+		strings.Contains(content, "<max_thinking_length>") ||
+		strings.Contains(content, "<thinking_effort>")
+}
+
+// stripLegacyThinkingHints 移除内容中残留的 thinking prefix（旧版 interleaved/16000 或新版 enabled/adaptive）
+// 用于历史 user 消息合并时清理，避免重复注入；不改变 thinking content 块（<thinking>...</thinking>）
+func stripLegacyThinkingHints(s string) string {
+	return legacyThinkingHintPattern.ReplaceAllString(s, "")
+}
+
+// formatAssistantThinkingAndText 把历史 assistant 的 thinking + text 块拼成单一字符串
+// 与 kiro.rs convert_assistant_message 的输出格式对齐：
+//   - 二者都有 → "<thinking>{th}</thinking>\n\n{text}"
+//   - 只有 thinking → "<thinking>{th}</thinking>"
+//   - 只有 text → "{text}"
+func formatAssistantThinkingAndText(thinking, text string) string {
+	if thinking == "" {
 		return text
 	}
-	separator := ""
-	if !strings.HasSuffix(text, "\n") && !strings.HasSuffix(text, "\r") {
-		separator = "\n"
+	if text == "" {
+		return ThinkingStartTag + thinking + ThinkingEndTag
 	}
-	return text + separator + ThinkingHint
+	return ThinkingStartTag + thinking + ThinkingEndTag + "\n\n" + text
 }
 
 // detectToolCallLoop 检测是否存在无限工具调用循环
@@ -698,8 +787,9 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		return nil, err
 	}
 
-	// 检测 thinking 模式
-	thinkingEnabled := isThinkingModeEnabled(req.Thinking)
+	// 解析 thinking 配置（与 kiro.rs 对齐：支持 enabled / adaptive，prefix 注入到 system）
+	thinkingCfg := parseThinkingConfig(req.Thinking, req.OutputConfig)
+	thinkingPrefix := generateThinkingPrefix(thinkingCfg)
 
 	// 1. 转换工具
 	var aqTools []models.Tool
@@ -804,10 +894,8 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 		}
 	}
 
-	// 如果启用了 thinking 模式，添加 thinking 提示
-	if thinkingEnabled && promptContent != "" {
-		promptContent = appendThinkingHint(promptContent)
-	}
+	// 注意：thinking prefix 不再追加到当前 user 消息末尾
+	// 与 kiro.rs 一致，prefix 在第 6 步注入到 system 消息（详见下方）
 
 	// 3. 构建上下文
 	userCtx := models.UserInputMessageContext{
@@ -844,6 +932,12 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 	// 5. 模型映射（支持规范名称和短名称）
 	modelID := MapModelName(req.Model)
 
+	// thinking 仅在 kiro ModelID == claude-sonnet-4.5 时生效；其它模型忽略 thinking 配置
+	if thinkingPrefix != "" && modelID != thinkingSupportedModelID {
+		logger.Debug("[消息转换] thinking 配置被忽略：当前模型 %s 不支持（仅 %s 支持）", modelID, thinkingSupportedModelID)
+		thinkingPrefix = ""
+	}
+
 	// 6. 用户输入消息（
 	userInputMsg := models.UserInputMessage{
 		Content:                 formattedContent,
@@ -860,34 +954,42 @@ func ConvertClaudeToAmazonQ(req *models.ClaudeRequest, conversationID string, _ 
 	}
 
 	// 处理 system prompt（与参考项目一致：转换为 user-assistant 消息对）
+	// thinking prefix（如启用）以 kiro.rs 一致的方式注入到 system 最前面
 	var systemHistory []models.HistoryMessage
+	sysText := ""
 	if req.System != nil {
-		sysText := extractSystemText(req.System)
+		sysText = extractSystemText(req.System)
+	}
+	if thinkingPrefix != "" && !hasThinkingTags(sysText) {
 		if sysText != "" {
-			// system prompt 转换为 user-assistant 消息对
-			systemHistory = append(systemHistory, models.HistoryMessage{
-				UserInputMessage: &models.UserInputMessage{
-					Content: sysText,
-					UserInputMessageContext: models.UserInputMessageContext{
-						EnvState: models.EnvState{
-							OperatingSystem:         getOperatingSystem(),
-							CurrentWorkingDirectory: "/",
-						},
-					},
-					Origin:  "AI_EDITOR",
-					ModelID: modelID,
-				},
-			})
-			systemHistory = append(systemHistory, models.HistoryMessage{
-				AssistantResponseMessage: &models.AssistantResponseMessage{
-					Content: "OK",
-				},
-			})
+			sysText = thinkingPrefix + "\n" + sysText
+		} else {
+			sysText = thinkingPrefix
 		}
 	}
+	if sysText != "" {
+		systemHistory = append(systemHistory, models.HistoryMessage{
+			UserInputMessage: &models.UserInputMessage{
+				Content: sysText,
+				UserInputMessageContext: models.UserInputMessageContext{
+					EnvState: models.EnvState{
+						OperatingSystem:         getOperatingSystem(),
+						CurrentWorkingDirectory: "/",
+					},
+				},
+				Origin:  "AI_EDITOR",
+				ModelID: modelID,
+			},
+		})
+		systemHistory = append(systemHistory, models.HistoryMessage{
+			AssistantResponseMessage: &models.AssistantResponseMessage{
+				Content: "OK",
+			},
+		})
+	}
 
-	// 处理常规历史消息
-	aqHistory := processClaudeHistoryWithMessageID(historyMsgs, thinkingEnabled, modelID)
+	// 处理常规历史消息（thinking prefix 已在 system 注入，此处不再单独追加）
+	aqHistory := processClaudeHistoryWithMessageID(historyMsgs, modelID)
 
 	// 合并 system 历史和常规历史
 	fullHistory := append(systemHistory, aqHistory...)
@@ -1193,28 +1295,33 @@ func sanitizeJSONSchema(schema map[string]interface{}) map[string]interface{} {
 }
 
 // extractClaudeTextContent 从 Claude 内容中提取文本（包括 thinking 内容）
+// 与 kiro.rs convert_assistant_message 的输出格式对齐：thinking 块整体先于 text 块，
+// 中间用 \n\n 分隔，确保流式解析侧的 </thinking>\n\n 边界匹配
 func extractClaudeTextContent(content interface{}) string {
 	switch c := content.(type) {
 	case string:
 		return c
 	case []interface{}:
-		var parts []string
+		var thinkingParts []string
+		var textParts []string
 		for _, block := range c {
 			if m, ok := block.(map[string]interface{}); ok {
 				blockType, _ := m["type"].(string)
 				if blockType == "text" {
 					if text, ok := m["text"].(string); ok {
-						parts = append(parts, text)
+						textParts = append(textParts, text)
 					}
 				} else if blockType == "thinking" {
-					// 将 thinking 内容包装成 XML 标签
 					if thinking, ok := m["thinking"].(string); ok {
-						parts = append(parts, wrapThinkingContent(thinking))
+						thinkingParts = append(thinkingParts, thinking)
 					}
 				}
 			}
 		}
-		return strings.Join(parts, "\n")
+		// 多个 thinking 块直接拼接（与 kiro.rs 一致）；多个 text 块用 \n 连接保留可读性
+		thinkingStr := strings.Join(thinkingParts, "")
+		textStr := strings.Join(textParts, "\n")
+		return formatAssistantThinkingAndText(thinkingStr, textStr)
 	}
 	return ""
 }
@@ -1396,7 +1503,8 @@ func extractClaudeToolResults(content interface{}) []models.ToolResult {
 }
 
 // processClaudeHistoryWithMessageID 处理 Claude 历史消息，转换为 Amazon Q 格式
-func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinkingEnabled bool, modelID string) []models.HistoryMessage {
+// thinking prefix 已在 system 消息中一次性注入，此处不再追加到每条 user 消息
+func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, modelID string) []models.HistoryMessage {
 	var history []models.HistoryMessage
 	seenToolUseIDs := make(map[string]bool)
 	var lastToolUseOrder []string
@@ -1421,11 +1529,6 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 			// 根据上一个 assistant 消息中的 tool_use 顺序重新排序 tool_results
 			if len(toolResults) > 0 && len(lastToolUseOrder) > 0 {
 				toolResults = reorderToolResultsByToolUses(toolResults, lastToolUseOrder)
-			}
-
-			// 如果启用了 thinking 模式，添加 thinking 提示
-			if thinkingEnabled && textContent != "" {
-				textContent = appendThinkingHint(textContent)
 			}
 
 			userCtx := &models.UserInputMessageContext{
@@ -1555,7 +1658,8 @@ func processClaudeHistoryWithMessageID(messages []models.ClaudeMessage, thinking
 // - 如果检测到连续的相同角色消息，应用合并逻辑
 // 关键修复：追踪 assistant 消息中的 tool_use 顺序，并在下一个 user 消息中重新排序 tool_results 以匹配
 // Deprecated: 建议使用 processClaudeHistoryWithMessageID
-func processClaudeHistory(messages []models.ClaudeMessage, thinkingEnabled bool) []models.HistoryMessage {
+// thinking prefix 已在 system 消息中一次性注入，此处不再追加到每条 user 消息
+func processClaudeHistory(messages []models.ClaudeMessage) []models.HistoryMessage {
 	var rawHistory []models.HistoryMessage
 	seenToolUseIDs := make(map[string]bool)
 	var lastToolUseOrder []string // 追踪上一个 assistant 消息中的 tool_use 顺序
@@ -1571,11 +1675,6 @@ func processClaudeHistory(messages []models.ClaudeMessage, thinkingEnabled bool)
 			if len(toolResults) > 0 && len(lastToolUseOrder) > 0 {
 				toolResults = reorderToolResultsByToolUses(toolResults, lastToolUseOrder)
 				logger.Debug("[历史处理] 重新排序 %d 个 tool_results 以匹配 tool_use 顺序", len(toolResults))
-			}
-
-			// 如果启用了 thinking 模式，添加 thinking 提示
-			if thinkingEnabled && textContent != "" {
-				textContent = appendThinkingHint(textContent)
 			}
 
 			userCtx := &models.UserInputMessageContext{
@@ -1809,9 +1908,6 @@ func mergeClaudeUserMessages(msgs []*models.UserInputMessage) *models.UserInputM
 	toolResultsByID := make(map[string]*models.ToolResult)
 	var toolResultOrder []string // 保持顺序
 
-	// 检查是否有消息包含 thinking hint
-	hadThinkingHint := false
-
 	for i, m := range msgs {
 		// 初始化基础上下文（从第一个消息）
 		if i == 0 {
@@ -1836,13 +1932,13 @@ func mergeClaudeUserMessages(msgs []*models.UserInputMessage) *models.UserInputM
 			}
 		}
 
-		// 处理内容：移除 thinking hint 以避免重复
+		// 处理内容：清理历史残留的 thinking prefix（兼容老版本 interleaved 与新版 enabled/adaptive）
+		// 新模式 prefix 只在 system 注入，user 消息不应再有；这里只是对历史脏数据兜底
 		content := m.Content
 		if content != "" {
-			if strings.Contains(content, ThinkingHint) {
-				hadThinkingHint = true
-				content = strings.ReplaceAll(content, ThinkingHint, "")
-				content = strings.TrimSpace(content)
+			stripped := stripLegacyThinkingHints(content)
+			if stripped != content {
+				content = strings.TrimSpace(stripped)
 			}
 			if content != "" {
 				allContents = append(allContents, content)
@@ -1855,13 +1951,8 @@ func mergeClaudeUserMessages(msgs []*models.UserInputMessage) *models.UserInputM
 		}
 	}
 
-	// 合并内容
+	// 合并内容（thinking prefix 已在 system 注入，此处不再回填）
 	mergedContent := strings.Join(allContents, "\n\n")
-
-	// 如果原始消息有 thinking hint，在合并内容末尾添加一次
-	if hadThinkingHint && mergedContent != "" {
-		mergedContent = appendThinkingHint(mergedContent)
-	}
 
 	result := &models.UserInputMessage{
 		Content:                 mergedContent,

@@ -23,7 +23,8 @@ type ClaudeRequest struct {
 	ToolChoice     interface{}     `json:"tool_choice,omitempty"`     // 工具选择策略（与参考项目一致）
 	Stream         bool            `json:"stream,omitempty"`
 	System         interface{}     `json:"system,omitempty"`          // 可以是字符串或 []SystemBlock
-	Thinking       interface{}     `json:"thinking,omitempty"`        // thinking 模式配置
+	Thinking       interface{}     `json:"thinking,omitempty"`        // thinking 模式配置（type: "enabled" | "adaptive"）
+	OutputConfig   interface{}     `json:"output_config,omitempty"`   // adaptive thinking 用 effort 字段（"low"|"medium"|"high"）
 	ConversationID *string         `json:"conversation_id,omitempty"` // 会话 ID（支持 conversation_id 和 conversationId）
 }
 

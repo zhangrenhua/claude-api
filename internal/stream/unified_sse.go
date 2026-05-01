@@ -22,12 +22,12 @@ type UnifiedStreamHandler struct {
 	InputTokens    int
 
 	// 内部状态
-	outputBuffer         []string
-	thinkingBuffer       string
-	inThinking           bool
-	metaSent             bool
-	pendingStartTagChars int
-	doneSent             bool
+	outputBuffer                []string
+	thinkingBuffer              string
+	inThinking                  bool
+	metaSent                    bool
+	stripThinkingLeadingNewline bool // <thinking>\n 中前导 \n 跨 chunk 剥离
+	doneSent                    bool
 	// token 计数（基于流式 delta 事件，更准确）
 	// 根据 anthropic-tokenizer 项目，每个流式 delta 对应一个 token
 	outputDeltaCount int
@@ -60,7 +60,7 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 				"type":            "meta",
 				"conversation_id": h.ConversationID,
 				"model":           h.Model,
-				"input_tokens":    h.InputTokens,
+				"input_tokens":    InflateTokenCount(h.InputTokens),
 			}
 			if h.CacheCreationInputTokens > 0 {
 				meta["cache_creation_input_tokens"] = h.CacheCreationInputTokens
@@ -90,6 +90,10 @@ func (h *UnifiedStreamHandler) HandleEvent(eventType string, payload map[string]
 			h.pendingKiroBuffer = ""
 			events = append(events, h.flushThinkingBuffer()...)
 		}
+
+		// 流尾刷出 thinkingBuffer 中保留的尾部字节（最多 10/13 字节）
+		// 用 buffer-end 边界规则识别 </thinking>（标签后只有空白即可）
+		events = append(events, h.flushThinkingBufferAtEnd()...)
 
 		if !h.doneSent {
 			events = append(events, h.done("stop"))
@@ -122,8 +126,8 @@ func (h *UnifiedStreamHandler) done(reason string) string {
 		"type":          "done",
 		"finish_reason": reason,
 		"usage": map[string]int{
-			"input_tokens":  h.InputTokens,
-			"output_tokens": outputTokens,
+			"input_tokens":  InflateTokenCount(h.InputTokens),
+			"output_tokens": InflateTokenCount(outputTokens),
 		},
 	})
 }
@@ -164,94 +168,161 @@ func (h *UnifiedStreamHandler) Finish(reason string) string {
 }
 
 // flushThinkingBuffer 解析 thinking 标签，输出对应事件
+// 与 claude_sse.go 共用 findRealThinking* 系列：28 字符引用前后缀过滤、</thinking> 后强制 \n\n
+// 跨 chunk 部分标签保护：起始保留末尾 10 字节，结束保留末尾 13 字节
 func (h *UnifiedStreamHandler) flushThinkingBuffer() []string {
 	var events []string
 
 	for h.thinkingBuffer != "" {
-		// 处理待定的开始标签字符
-		if h.pendingStartTagChars > 0 {
-			if len(h.thinkingBuffer) < h.pendingStartTagChars {
-				h.pendingStartTagChars -= len(h.thinkingBuffer)
-				h.thinkingBuffer = ""
+		if !h.inThinking {
+			startPos := findRealThinkingStartTag(h.thinkingBuffer)
+			if startPos == -1 {
+				// 没找到起始：保留末尾 10 字节防部分标签
+				target := len(h.thinkingBuffer) - len(ThinkingStartTag)
+				if target < 0 {
+					target = 0
+				}
+				safeLen := findCharBoundary(h.thinkingBuffer, target)
+				if safeLen > 0 {
+					textChunk := h.thinkingBuffer[:safeLen]
+					if strings.TrimSpace(textChunk) != "" {
+						h.outputBuffer = append(h.outputBuffer, textChunk)
+						events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
+							"type": "answer_delta",
+							"text": textChunk,
+						}))
+						h.thinkingBuffer = h.thinkingBuffer[safeLen:]
+					}
+				}
 				break
 			}
-			h.thinkingBuffer = h.thinkingBuffer[h.pendingStartTagChars:]
-			h.pendingStartTagChars = 0
+
+			before := h.thinkingBuffer[:startPos]
+			// 跳过纯空白前缀，避免在 thinking 块前生成空 answer_delta
+			if strings.TrimSpace(before) != "" {
+				h.outputBuffer = append(h.outputBuffer, before)
+				events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
+					"type": "answer_delta",
+					"text": before,
+				}))
+			}
+			h.thinkingBuffer = h.thinkingBuffer[startPos+len(ThinkingStartTag):]
+			h.inThinking = true
+			h.stripThinkingLeadingNewline = true
+			continue
+		}
+
+		// 在 thinking 块内：剥离 <thinking>\n 的前导 \n
+		if h.stripThinkingLeadingNewline {
+			if strings.HasPrefix(h.thinkingBuffer, "\n") {
+				h.thinkingBuffer = h.thinkingBuffer[1:]
+				h.stripThinkingLeadingNewline = false
+			} else if h.thinkingBuffer != "" {
+				h.stripThinkingLeadingNewline = false
+			}
 			if h.thinkingBuffer == "" {
 				break
 			}
 		}
 
-		if !h.inThinking {
-			start := strings.Index(h.thinkingBuffer, ThinkingStartTag)
-			if start == -1 {
-				// 检查是否有部分起始标签
-				pending := pendingTagSuffix(h.thinkingBuffer, ThinkingStartTag)
-				if pending == len(h.thinkingBuffer) && pending > 0 {
-					h.pendingStartTagChars = len(ThinkingStartTag) - pending
-					h.thinkingBuffer = ""
-					break
-				}
-				emitLen := len(h.thinkingBuffer) - pending
-				if emitLen <= 0 {
-					break
-				}
-				textChunk := h.thinkingBuffer[:emitLen]
-				if textChunk != "" {
-					h.outputBuffer = append(h.outputBuffer, textChunk)
-					events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
-						"type": "answer_delta",
-						"text": textChunk,
-					}))
-				}
-				h.thinkingBuffer = h.thinkingBuffer[emitLen:]
-			} else {
-				before := h.thinkingBuffer[:start]
-				if before != "" {
-					h.outputBuffer = append(h.outputBuffer, before)
-					events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
-						"type": "answer_delta",
-						"text": before,
-					}))
-				}
-				h.thinkingBuffer = h.thinkingBuffer[start+len(ThinkingStartTag):]
-				// 进入 thinking 块
-				h.inThinking = true
+		endPos := findRealThinkingEndTag(h.thinkingBuffer)
+		if endPos != -1 {
+			thinkChunk := h.thinkingBuffer[:endPos]
+			if thinkChunk != "" {
+				events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
+					"type": "thinking_delta",
+					"text": thinkChunk,
+				}))
 			}
-		} else {
-			end := strings.Index(h.thinkingBuffer, ThinkingEndTag)
-			if end == -1 {
-				// 检查未完整的结束标签
-				pending := pendingTagSuffix(h.thinkingBuffer, ThinkingEndTag)
-				emitLen := len(h.thinkingBuffer) - pending
-				if emitLen <= 0 {
-					break
-				}
-				thinkChunk := h.thinkingBuffer[:emitLen]
-				if thinkChunk != "" {
-					events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
-						"type": "thinking_delta",
-						"text": thinkChunk,
-					}))
-				}
-				h.thinkingBuffer = h.thinkingBuffer[emitLen:]
-				if pending > 0 {
-					h.pendingStartTagChars = pending
-				}
-			} else {
-				thinkChunk := h.thinkingBuffer[:end]
-				if thinkChunk != "" {
-					events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
-						"type": "thinking_delta",
-						"text": thinkChunk,
-					}))
-				}
-				h.thinkingBuffer = h.thinkingBuffer[end+len(ThinkingEndTag):]
-				h.inThinking = false
-				h.pendingStartTagChars = 0
-			}
+			h.thinkingBuffer = h.thinkingBuffer[endPos+thinkingEndTagPlusNewlines:]
+			h.inThinking = false
+			continue
 		}
+
+		// 没找到 </thinking>\n\n：保留末尾 13 字节
+		target := len(h.thinkingBuffer) - thinkingEndTagPlusNewlines
+		if target < 0 {
+			target = 0
+		}
+		safeLen := findCharBoundary(h.thinkingBuffer, target)
+		if safeLen > 0 {
+			thinkChunk := h.thinkingBuffer[:safeLen]
+			if thinkChunk != "" {
+				events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
+					"type": "thinking_delta",
+					"text": thinkChunk,
+				}))
+			}
+			h.thinkingBuffer = h.thinkingBuffer[safeLen:]
+		}
+		break
 	}
 
+	return events
+}
+
+// flushThinkingBufferAtEnd 流尾刷出 thinkingBuffer 中残留的尾部字节
+// 与 flushThinkingBuffer 配合：常规流程保留 10/13 字节防部分标签，流结束时本函数释放尾部
+// 在 thinking 块内：用 buffer-end 边界规则（标签后只有空白即可）识别结束标签
+// 不在 thinking 块内：剩余 buffer 全部作为 answer_delta 发出
+func (h *UnifiedStreamHandler) flushThinkingBufferAtEnd() []string {
+	var events []string
+	if h.thinkingBuffer == "" {
+		return events
+	}
+
+	for h.thinkingBuffer != "" {
+		if h.inThinking {
+			endPos := findRealThinkingEndTag(h.thinkingBuffer)
+			if endPos == -1 {
+				endPos = findRealThinkingEndTagAtBufferEnd(h.thinkingBuffer)
+			}
+			if endPos != -1 {
+				thinkChunk := h.thinkingBuffer[:endPos]
+				if thinkChunk != "" {
+					events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
+						"type": "thinking_delta",
+						"text": thinkChunk,
+					}))
+				}
+				h.thinkingBuffer = h.thinkingBuffer[endPos+len(ThinkingEndTag):]
+				h.thinkingBuffer = strings.TrimLeft(h.thinkingBuffer, " \t\r\n")
+				h.inThinking = false
+				continue
+			}
+			// 没找到结束标签：剩余作为 thinking_delta 兜底发出
+			events = append(events, buildUnifiedEvent("thinking_delta", map[string]interface{}{
+				"type": "thinking_delta",
+				"text": h.thinkingBuffer,
+			}))
+			h.thinkingBuffer = ""
+			break
+		}
+
+		// 非 thinking 状态：剩余 buffer 作为 answer 发出
+		startPos := findRealThinkingStartTag(h.thinkingBuffer)
+		if startPos == -1 {
+			if strings.TrimSpace(h.thinkingBuffer) != "" {
+				h.outputBuffer = append(h.outputBuffer, h.thinkingBuffer)
+				events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
+					"type": "answer_delta",
+					"text": h.thinkingBuffer,
+				}))
+			}
+			h.thinkingBuffer = ""
+			break
+		}
+		// 末尾还有 <thinking> 起始：发出之前的内容，进入 thinking 模式
+		before := h.thinkingBuffer[:startPos]
+		if strings.TrimSpace(before) != "" {
+			h.outputBuffer = append(h.outputBuffer, before)
+			events = append(events, buildUnifiedEvent("answer_delta", map[string]interface{}{
+				"type": "answer_delta",
+				"text": before,
+			}))
+		}
+		h.thinkingBuffer = h.thinkingBuffer[startPos+len(ThinkingStartTag):]
+		h.inThinking = true
+	}
 	return events
 }

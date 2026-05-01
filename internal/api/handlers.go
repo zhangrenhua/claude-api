@@ -2176,6 +2176,12 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		c.Set("original_model", originalDownstreamModel)
 	}
 
+	// 模型名带 -thinking 后缀且客户端未显式配置 thinking → 默认开启 enabled 模式
+	if claude.HasThinkingSuffix(originalDownstreamModel) && req.Thinking == nil {
+		req.Thinking = map[string]interface{}{"type": "enabled"}
+		logger.Debug("[模型映射] 模型 %s 带 -thinking 后缀，自动开启 thinking 模式", originalDownstreamModel)
+	}
+
 	// opus 模型桥接：如果模型名包含 opus，转发到 localhost:3003 服务（已禁用，直接在本服务处理）
 	// if strings.Contains(strings.ToLower(req.Model), "opus") {
 	// 	logger.Info("[Opus 桥接] 检测到 opus 模型: %s, 转发至 localhost:3003 - 来源: %s", req.Model, clientIP)
@@ -2949,8 +2955,8 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		"conversation_id": conversationID,
 		"conversationId":  conversationID,
 		"usage": map[string]interface{}{
-			"input_tokens":                cacheInfo.InputTokens,
-			"output_tokens":               outputTokens,
+			"input_tokens":                stream.InflateTokenCount(cacheInfo.InputTokens),
+			"output_tokens":               stream.InflateTokenCount(outputTokens),
 			"cache_creation_input_tokens": cacheInfo.CacheCreationInputTokens,
 			"cache_read_input_tokens":     cacheInfo.CacheReadInputTokens,
 		},
@@ -2963,7 +2969,7 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 	duration := time.Since(startTime)
 	s.QueueStatsUpdate(acc.ID, true)
 
-	// 设置 token 数量用于日志记录
+	// 设置 token 数量用于日志记录（保留原始值，不参与 +5% 上浮）
 	c.Set("input_tokens", inputTokens)
 	c.Set("output_tokens", outputTokens)
 
@@ -3120,6 +3126,11 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 
 	// 转换请求：OpenAI -> Claude -> Amazon Q
 	claudeReq := convertOpenAIToClaude(&req)
+	// 模型名带 -thinking 后缀且未显式配置 thinking → 默认开启 enabled 模式
+	if claude.HasThinkingSuffix(originalDownstreamModel) && claudeReq.Thinking == nil {
+		claudeReq.Thinking = map[string]interface{}{"type": "enabled"}
+		logger.Debug("[模型映射] OpenAI 模型 %s 带 -thinking 后缀，自动开启 thinking 模式", originalDownstreamModel)
+	}
 	aqPayload, convErr := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
 	if convErr != nil {
 		logger.Error("请求转换失败 - 错误: %v", convErr)
@@ -3391,9 +3402,9 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 			},
 		},
 		"usage": map[string]interface{}{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
+			"prompt_tokens":     stream.InflateTokenCount(promptTokens),
+			"completion_tokens": stream.InflateTokenCount(completionTokens),
+			"total_tokens":      stream.InflateTokenCount(promptTokens) + stream.InflateTokenCount(completionTokens),
 		},
 	}
 
@@ -3418,7 +3429,8 @@ func (s *Server) handleCountTokens(c *gin.Context) {
 	}
 
 	tokenCount := estimateTokens(string(body))
-	c.JSON(http.StatusOK, gin.H{"input_tokens": tokenCount})
+	// 与正式响应中的 input_tokens 计费口径保持一致：+5% 上浮
+	c.JSON(http.StatusOK, gin.H{"input_tokens": stream.InflateTokenCount(tokenCount)})
 }
 
 // handleResponses 处理 OpenAI Responses API 端点
@@ -3576,6 +3588,12 @@ func (s *Server) handleResponses(c *gin.Context) {
 				claudeReq.Thinking = map[string]interface{}{"type": "enabled", "budget_tokens": 16000}
 			}
 		}
+	}
+
+	// 模型名带 -thinking 后缀且仍未配置 thinking → 默认开启 enabled 模式
+	if claude.HasThinkingSuffix(originalDownstreamModel) && claudeReq.Thinking == nil {
+		claudeReq.Thinking = map[string]interface{}{"type": "enabled"}
+		logger.Debug("[模型映射] Responses 模型 %s 带 -thinking 后缀，自动开启 thinking 模式", originalDownstreamModel)
 	}
 
 	aqPayload, convErr := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
@@ -3856,9 +3874,9 @@ func (s *Server) handleResponsesNonStreamResponse(c *gin.Context, resp *http.Res
 		"status":     "completed",
 		"output":     output,
 		"usage": map[string]interface{}{
-			"input_tokens":  promptTokens,
-			"output_tokens": completionTokens,
-			"total_tokens":  promptTokens + completionTokens,
+			"input_tokens":  stream.InflateTokenCount(promptTokens),
+			"output_tokens": stream.InflateTokenCount(completionTokens),
+			"total_tokens":  stream.InflateTokenCount(promptTokens) + stream.InflateTokenCount(completionTokens),
 		},
 	}
 

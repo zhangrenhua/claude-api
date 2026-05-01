@@ -333,6 +333,18 @@ func (h *ResponsesStreamHandler) HandleEvent(eventType string, payload map[strin
 			h.PendingKiroBuffer = ""
 		}
 
+		// 流尾刷出 ThinkBuffer 中保留的尾部字节（最多 10/13 字节）
+		// 处理 buffer-end 边界：thinking 后只有空白也认作结束标签
+		if tail := h.flushFilterThinkingAtEnd(); tail != "" {
+			h.ResponseBuffer = append(h.ResponseBuffer, tail)
+			events = append(events, h.buildEvent("response.output_text.delta", map[string]interface{}{
+				"item_id":       h.MessageID,
+				"output_index":  0,
+				"content_index": 0,
+				"delta":         tail,
+			}))
+		}
+
 		if h.TextStarted {
 			events = append(events, h.finalizeTextContent()...)
 		}
@@ -434,10 +446,12 @@ func (h *ResponsesStreamHandler) BuildCompletedEvent(inputTokens, outputTokens i
 		})
 	}
 
+	inflatedIn := InflateTokenCount(inputTokens)
+	inflatedOut := InflateTokenCount(outputTokens)
 	usage := map[string]interface{}{
-		"input_tokens":  inputTokens,
-		"output_tokens": outputTokens,
-		"total_tokens":  inputTokens + outputTokens,
+		"input_tokens":  inflatedIn,
+		"output_tokens": inflatedOut,
+		"total_tokens":  inflatedIn + inflatedOut,
 	}
 
 	return h.buildEvent("response.completed", map[string]interface{}{
@@ -468,62 +482,111 @@ func (h *ResponsesStreamHandler) ResponseText() string {
 
 // filterThinking 过滤流式内容中的 <thinking>...</thinking> 块
 // 返回 thinking 块之外的文本内容，thinking 内容被丢弃
+// 与 claude_sse.go 共用 findRealThinking* 系列：28 字符引用前后缀过滤、</thinking> 后强制 \n\n
 func (h *ResponsesStreamHandler) filterThinking(content string) string {
 	h.ThinkBuffer += content
 	var result string
 
 	for h.ThinkBuffer != "" {
 		if h.InThinking {
-			endIdx := strings.Index(h.ThinkBuffer, ThinkingEndTag)
-			if endIdx == -1 {
-				// 还在 thinking 中，检查末尾是否有部分结束标签
-				pending := pendingTagSuffix(h.ThinkBuffer, ThinkingEndTag)
-				if pending > 0 {
-					h.ThinkBuffer = h.ThinkBuffer[len(h.ThinkBuffer)-pending:]
-				} else {
-					h.ThinkBuffer = ""
+			endPos := findRealThinkingEndTag(h.ThinkBuffer)
+			if endPos == -1 {
+				// 还在 thinking 中：保留末尾 13 字节防止部分 </thinking>\n\n 被错误丢弃
+				target := len(h.ThinkBuffer) - thinkingEndTagPlusNewlines
+				if target < 0 {
+					target = 0
 				}
+				safeLen := findCharBoundary(h.ThinkBuffer, target)
+				h.ThinkBuffer = h.ThinkBuffer[safeLen:]
 				return result
 			}
 			h.InThinking = false
-			h.ThinkBuffer = h.ThinkBuffer[endIdx+len(ThinkingEndTag):]
+			h.ThinkBuffer = h.ThinkBuffer[endPos+thinkingEndTagPlusNewlines:]
 			continue
 		}
 
-		startIdx := strings.Index(h.ThinkBuffer, ThinkingStartTag)
-		if startIdx == -1 {
-			// 无 thinking 标签，检查末尾部分匹配
-			pending := pendingTagSuffix(h.ThinkBuffer, ThinkingStartTag)
-			if pending > 0 {
-				result += h.ThinkBuffer[:len(h.ThinkBuffer)-pending]
-				h.ThinkBuffer = h.ThinkBuffer[len(h.ThinkBuffer)-pending:]
-			} else {
-				result += h.ThinkBuffer
-				h.ThinkBuffer = ""
+		startPos := findRealThinkingStartTag(h.ThinkBuffer)
+		if startPos == -1 {
+			// 无 thinking 起始标签：保留末尾 len(<thinking>)=10 字节防止部分标签被发出
+			target := len(h.ThinkBuffer) - len(ThinkingStartTag)
+			if target < 0 {
+				target = 0
 			}
+			safeLen := findCharBoundary(h.ThinkBuffer, target)
+			result += h.ThinkBuffer[:safeLen]
+			h.ThinkBuffer = h.ThinkBuffer[safeLen:]
 			return result
 		}
 
-		result += h.ThinkBuffer[:startIdx]
-		h.ThinkBuffer = h.ThinkBuffer[startIdx+len(ThinkingStartTag):]
+		result += h.ThinkBuffer[:startPos]
+		h.ThinkBuffer = h.ThinkBuffer[startPos+len(ThinkingStartTag):]
 		h.InThinking = true
 	}
 
 	return result
 }
 
+// flushFilterThinkingAtEnd 流尾刷出 ThinkBuffer 中残留的字节，返回非 thinking 内容
+// 与 filterThinking 配合使用：filterThinking 在常规流程中保留末尾 10/13 字节防部分标签
+// 流结束时调用本函数释放尾部，并用 buffer-end 边界规则识别 </thinking>（标签后只有空白）
+// thinking 内容仍然被丢弃（与 filterThinking 语义一致）
+func (h *ResponsesStreamHandler) flushFilterThinkingAtEnd() string {
+	if h.ThinkBuffer == "" {
+		return ""
+	}
+	var result string
+
+	for h.ThinkBuffer != "" {
+		if h.InThinking {
+			// 优先严格匹配（带 \n\n）
+			endPos := findRealThinkingEndTag(h.ThinkBuffer)
+			if endPos == -1 {
+				// 退而求其次：标签后只有空白
+				endPos = findRealThinkingEndTagAtBufferEnd(h.ThinkBuffer)
+			}
+			if endPos == -1 {
+				// 没有结束标签：剩余视为 thinking 内容直接丢弃
+				h.ThinkBuffer = ""
+				break
+			}
+			h.InThinking = false
+			h.ThinkBuffer = h.ThinkBuffer[endPos+len(ThinkingEndTag):]
+			h.ThinkBuffer = strings.TrimLeft(h.ThinkBuffer, " \t\r\n")
+			continue
+		}
+
+		// 非 thinking 状态：剩余 buffer 全部作为文本输出
+		startPos := findRealThinkingStartTag(h.ThinkBuffer)
+		if startPos == -1 {
+			result += h.ThinkBuffer
+			h.ThinkBuffer = ""
+			break
+		}
+		result += h.ThinkBuffer[:startPos]
+		h.ThinkBuffer = h.ThinkBuffer[startPos+len(ThinkingStartTag):]
+		h.InThinking = true
+	}
+	return result
+}
+
 // StripThinkingTags 从完整文本中移除所有 <thinking>...</thinking> 块（用于非流式响应）
+// 与流式判定一致：起始用 findRealThinkingStartTag，结束优先 \n\n 严格匹配，退化到末尾全空白
 func StripThinkingTags(text string) string {
 	for {
-		start := strings.Index(text, ThinkingStartTag)
-		if start == -1 {
+		startPos := findRealThinkingStartTag(text)
+		if startPos == -1 {
 			return strings.TrimSpace(text)
 		}
-		end := strings.Index(text[start:], ThinkingEndTag)
-		if end == -1 {
-			// 没有闭合标签，移除从 start 到末尾
-			return strings.TrimSpace(text[:start])
+		afterOpen := text[startPos+len(ThinkingStartTag):]
+		if endPos := findRealThinkingEndTag(afterOpen); endPos != -1 {
+			text = text[:startPos] + afterOpen[endPos+thinkingEndTagPlusNewlines:]
+			continue
 		}
-		text = text[:start] + text[start+end+len(ThinkingEndTag):]
+		if endPos := findRealThinkingEndTagAtBufferEnd(afterOpen); endPos != -1 {
+			text = text[:startPos] + strings.TrimLeft(afterOpen[endPos+len(ThinkingEndTag):], " \t\r\n")
+			continue
+		}
+		// 没有闭合标签，移除从 start 到末尾
+		return strings.TrimSpace(text[:startPos])
 	}
 }
