@@ -41,6 +41,9 @@ const (
 	cooldownPostRequestForced = 5 * time.Second
 	// cooldownInFlightTimeout cooldown 模式 in-flight 状态的兜底超时，超过则强制释放（防止状态泄漏）
 	cooldownInFlightTimeout = 3 * time.Minute
+	// cooldownUrgentExpiryWindow cooldown 模式下「即将过期」账号的优先窗口
+	// 剩余有效期 ≤ 该窗口的账号优先被选中（与前端 isAccountExpiringSoon 的 7 天阈值保持一致）
+	cooldownUrgentExpiryWindow = 7 * 24 * time.Hour
 )
 
 // rpmAccountState 单个账号的 RPM 调度状态
@@ -201,9 +204,65 @@ func (p *AccountPool) Refresh(ctx context.Context) {
 	if removed := p.pruneRPMStates(activeIDs); removed > 0 {
 		logger.Debug("[账号池] RPM 状态清理: 移除 %d 个已离池账号的状态", removed)
 	}
+	if removed := p.pruneCooldownStates(activeIDs); removed > 0 {
+		logger.Debug("[账号池] cooldown 状态清理: 移除 %d 个已离池账号的状态", removed)
+	}
 
 	elapsed := time.Since(startTime)
 	logger.Debug("[账号池] 刷新完成 - 账号数: %d, 选择方式: %s, 耗时: %.0fms", len(accounts), cfg.selectionMode, elapsed.Seconds()*1000)
+}
+
+// pruneCooldownStates 清理已不在账号池中的账号的 cooldown 状态
+// lastUsedTime / cooldownReleaseAt：跳过 in-flight 中的账号（让 ReleaseCooldown 自然清理，下次 Refresh 收敛）
+// cooldownInFlight：超过 3min 兜底超时视为状态泄漏，强制清理；未超时的等请求自然结束
+// 返回被清理的条目数
+func (p *AccountPool) pruneCooldownStates(activeIDs map[string]struct{}) int {
+	removed := 0
+
+	cleanIfOrphan := func(m *sync.Map) {
+		m.Range(func(key, value any) bool {
+			id, ok := key.(string)
+			if !ok {
+				return true
+			}
+			if _, alive := activeIDs[id]; alive {
+				return true
+			}
+			// 仍在 in-flight 中：让请求结束后 ReleaseCooldown 自然清理
+			if _, inFlight := p.cooldownInFlight.Load(id); inFlight {
+				return true
+			}
+			m.Delete(key)
+			removed++
+			return true
+		})
+	}
+	cleanIfOrphan(&p.lastUsedTime)
+	cleanIfOrphan(&p.cooldownReleaseAt)
+
+	// cooldownInFlight 自身的清理：离池且超过 3min 兜底超时的强制释放
+	now := time.Now()
+	p.cooldownInFlight.Range(func(key, value any) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, alive := activeIDs[id]; alive {
+			return true
+		}
+		claimedAt, ok := value.(time.Time)
+		if !ok {
+			return true
+		}
+		if now.Sub(claimedAt) <= cooldownInFlightTimeout {
+			return true
+		}
+		p.cooldownInFlight.Delete(key)
+		removed++
+		return true
+	})
+
+	return removed
 }
 
 // pruneRPMStates 清理已不在账号池中的账号的 RPM 状态
@@ -377,6 +436,7 @@ func (p *AccountPool) selectWeightedRandom(accounts []*models.Account) *models.A
 
 // selectCooldown 冷却时间选择账号
 // 过滤掉处于冷却期或 in-flight 中的账号，从可用账号中按轮询方式选择
+// 优先选中剩余有效期 ≤ cooldownUrgentExpiryWindow 的账号（避免临期账号过期作废）
 // 所有账号都不可用时返回 nil，由上层返回错误提示
 // 通过 LoadOrStore 原子地占用 in-flight 标记，防止并发请求选中同一账号
 func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account {
@@ -385,7 +445,10 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 	p.mu.RUnlock()
 
 	now := time.Now()
-	var available []*models.Account
+	urgentCutoff := now.Add(cooldownUrgentExpiryWindow).Unix()
+	nowUnix := now.Unix()
+
+	var urgent, normal []*models.Account
 
 	for _, acc := range accounts {
 		// in-flight 检查：账号正在处理请求时不可被再次选中
@@ -409,29 +472,51 @@ func (p *AccountPool) selectCooldown(accounts []*models.Account) *models.Account
 				continue
 			}
 		}
-		available = append(available, acc)
+		// 分组：剩余有效期 ≤ 7 天且未过期的账号进入紧急组优先消耗
+		// 已过期 / 长期 / 无 expiry 的账号统一走普通组兜底
+		if acc.TokenExpiry != nil && *acc.TokenExpiry > nowUnix && *acc.TokenExpiry <= urgentCutoff {
+			urgent = append(urgent, acc)
+		} else {
+			normal = append(normal, acc)
+		}
 	}
 
-	if len(available) == 0 {
-		// 所有账号都在冷却中或处理中，返回 nil 拒绝请求
+	if len(urgent)+len(normal) == 0 {
 		logger.Debug("[账号池] 冷却模式: 所有 %d 个账号均在冷却期内或处理中（%ds），拒绝调度", len(accounts), p.cfg.cooldownSeconds)
 		return nil
 	}
 
-	// 从可用账号中按轮询顺序尝试占用 in-flight；被并发抢占的跳过试下一个
-	n := uint32(len(available))
+	// 一次性推进 RR 计数器并在两组间共享起点，避免 fallback 时计数器被推进两次
+	// 每组各自对其长度取模，互不影响
 	start := atomic.AddUint32(&p.roundRobinIndex, 1) - 1
+	if picked := p.tryClaimCooldownRR(urgent, start); picked != nil {
+		return picked
+	}
+	if picked := p.tryClaimCooldownRR(normal, start); picked != nil {
+		return picked
+	}
+
+	logger.Debug("[账号池] 冷却模式: 可用 %d 个账号（紧急 %d / 普通 %d）均被并发抢占，拒绝调度", len(urgent)+len(normal), len(urgent), len(normal))
+	return nil
+}
+
+// tryClaimCooldownRR 在给定可用集合内按 round-robin 顺序尝试占用 in-flight
+// start 由调用方传入并跨组共享，确保单次 selectCooldown 调用只推进 RR 计数器一次
+// 占位成功返回该账号；全部被并发抢占返回 nil（由调用方决定回退到下一组或拒绝）
+func (p *AccountPool) tryClaimCooldownRR(available []*models.Account, start uint32) *models.Account {
+	n := uint32(len(available))
+	if n == 0 {
+		return nil
+	}
 	for i := uint32(0); i < n; i++ {
 		candidate := available[(start+i)%n]
 		claimedAt := time.Now()
 		if _, loaded := p.cooldownInFlight.LoadOrStore(candidate.ID, claimedAt); loaded {
-			continue // 被并发请求抢占，尝试下一个
+			continue
 		}
 		p.lastUsedTime.Store(candidate.ID, claimedAt)
 		return candidate
 	}
-
-	logger.Debug("[账号池] 冷却模式: 所有可用账号均被并发抢占，拒绝调度")
 	return nil
 }
 
@@ -601,17 +686,20 @@ func (p *AccountPool) ReleaseRPM(accountID string, failed bool) {
 }
 
 // ReleaseCooldown 标记账号请求已完成，清除 in-flight 标记并启动「完成后强制 cooldownPostRequestForced」冷却
-// 仅 cooldown 模式下生效；其它模式无副作用。多次调用幂等且不会降级（取 max）
+// in-flight 清理无条件执行，避免请求中途模式切换导致 in-flight 泄漏直到 3min 兜底超时
+// 5s 兜底冷却仅在当前仍为 cooldown 模式时设置；多次调用幂等且不会降级（取 max）
 // 与 selectCooldown 的 lastUsedTime+cooldownSeconds 一起取 max 决定下次可选时间
 func (p *AccountPool) ReleaseCooldown(accountID string) {
+	// 无条件清除 in-flight 占用：即使请求期间模式从 cooldown 切走，也要回收占用
+	// 其它模式不使用 cooldownInFlight，对它们而言 Delete 是无副作用的 no-op
+	p.cooldownInFlight.Delete(accountID)
+
 	p.mu.RLock()
 	mode := p.cfg.selectionMode
 	p.mu.RUnlock()
 	if mode != models.AccountSelectionCooldown {
 		return
 	}
-	// 清除 in-flight 占用，账号可被后续请求选中（仍受 cooldownSeconds + 5s 兜底约束）
-	p.cooldownInFlight.Delete(accountID)
 	newReleaseAt := time.Now().Add(cooldownPostRequestForced)
 	if existing, ok := p.cooldownReleaseAt.Load(accountID); ok {
 		if !newReleaseAt.After(existing.(time.Time)) {
