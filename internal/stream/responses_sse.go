@@ -590,3 +590,55 @@ func StripThinkingTags(text string) string {
 		return strings.TrimSpace(text[:startPos])
 	}
 }
+
+// SplitContentWithThinking 把含 <thinking>...</thinking>\n\n 块的非流式文本拆成 Claude 格式 content 数组
+// 输出顺序保持原文中的 thinking / text 交替顺序；多块支持
+//   - thinking 块 → {"type":"thinking","thinking":"..."}
+//   - 其余文本   → {"type":"text","text":"..."}
+// 与流式 processThinkBuffer 的判定逻辑一致：28 字符引用过滤 + </thinking> 后强制 \n\n（流尾允许空白）
+// 没有 thinking 标签的输入会原样返回单 text 块；纯空白片段会被跳过
+func SplitContentWithThinking(text string) []map[string]interface{} {
+	var blocks []map[string]interface{}
+	remaining := text
+
+	for remaining != "" {
+		startPos := findRealThinkingStartTag(remaining)
+		if startPos == -1 {
+			if strings.TrimSpace(remaining) != "" {
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": remaining})
+			}
+			return blocks
+		}
+
+		// 起始标签前的文本块（跳过纯空白）
+		before := remaining[:startPos]
+		if strings.TrimSpace(before) != "" {
+			blocks = append(blocks, map[string]interface{}{"type": "text", "text": before})
+		}
+
+		afterOpen := remaining[startPos+len(ThinkingStartTag):]
+		var thinkingContent, textAfter string
+		if endPos := findRealThinkingEndTag(afterOpen); endPos != -1 {
+			thinkingContent = afterOpen[:endPos]
+			textAfter = afterOpen[endPos+thinkingEndTagPlusNewlines:]
+		} else if endPos := findRealThinkingEndTagAtBufferEnd(afterOpen); endPos != -1 {
+			thinkingContent = afterOpen[:endPos]
+			textAfter = strings.TrimLeft(afterOpen[endPos+len(ThinkingEndTag):], " \t\r\n")
+		} else {
+			// 没有有效的结束标签：起始标签开始的部分一并作为 text 输出
+			if strings.TrimSpace(remaining[startPos:]) != "" {
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": remaining[startPos:]})
+			}
+			return blocks
+		}
+
+		// 剥离 thinking 内容前导 \n（与流式行为一致）
+		thinkingContent = strings.TrimPrefix(thinkingContent, "\n")
+		if thinkingContent != "" {
+			blocks = append(blocks, map[string]interface{}{"type": "thinking", "thinking": thinkingContent})
+		}
+
+		remaining = textAfter
+	}
+	return blocks
+}

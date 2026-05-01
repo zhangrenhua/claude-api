@@ -2891,10 +2891,12 @@ func (s *Server) handleClaudeNonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 构建最终响应内容
+	// 构建最终响应内容：把 <thinking>...</thinking>\n\n 拆成独立 content block（与流式行为对齐）
 	content := []interface{}{}
 	if fullContent != "" {
-		content = append(content, map[string]interface{}{"type": "text", "text": fullContent})
+		for _, blk := range stream.SplitContentWithThinking(fullContent) {
+			content = append(content, blk)
+		}
 	}
 
 	// 按顺序添加工具调用
@@ -3372,13 +3374,16 @@ func (s *Server) handleOpenAINonStreamResponse(c *gin.Context, resp *http.Respon
 		}
 	}
 
-	// 使用传入的 inputTokens，输出 token 使用 tokenizer 计算
+	// 使用传入的 inputTokens，输出 token 使用 tokenizer 计算（基于剥离前的内容，含 thinking）
 	promptTokens := inputTokens
 	completionTokens := tokenizer.CountTokens(fullContent)
 
+	// OpenAI Chat 协议没有 thinking 块概念：剥离 <thinking>...</thinking>\n\n 后再返回
+	visibleContent := stream.StripThinkingTags(fullContent)
+
 	message := map[string]interface{}{
 		"role":    "assistant",
-		"content": fullContent,
+		"content": visibleContent,
 	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
