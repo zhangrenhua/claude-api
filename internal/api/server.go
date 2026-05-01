@@ -2152,7 +2152,7 @@ func (s *Server) RefreshAccountTokenAndRetry(ctx context.Context, account *model
 
 // EnsureAccountReady 确保账号可用（被动刷新策略核心函数）
 // 执行流程：
-// 1. 检查令牌是否需要刷新（超过25分钟）→ 是 → 刷新令牌
+// 1. 检查令牌是否需要刷新（超过22分钟）→ 是 → 刷新令牌
 // 2. 整个过程对用户透明无感知
 // 注意：配额刷新由用户在页面手动触发，不在请求时自动刷新
 // @author ygw - 被动刷新策略
@@ -2160,7 +2160,7 @@ func (s *Server) EnsureAccountReady(ctx context.Context, account *models.Account
 	startTime := time.Now()
 	logger.Debug("[被动刷新] 开始检查账号 %s 令牌状态", account.ID)
 
-	// 检查并刷新过期的令牌（超过 25 分钟自动刷新）
+	// 检查并刷新过期的令牌（超过 22 分钟自动刷新）
 	if account.LastRefreshTime == nil || *account.LastRefreshTime == "" || *account.LastRefreshTime == "never" {
 		logger.Debug("[被动刷新] 账号 %s 从未刷新过令牌，执行刷新", account.ID)
 		if err := s.refreshAccountToken(ctx, account.ID); err != nil {
@@ -2171,8 +2171,8 @@ func (s *Server) EnsureAccountReady(ctx context.Context, account *models.Account
 		account, _ = s.db.GetAccount(ctx, account.ID)
 	} else {
 		lastRefresh, err := time.Parse(models.TimeFormat, *account.LastRefreshTime)
-		if err != nil || time.Since(lastRefresh) > 25*time.Minute {
-			logger.Debug("[被动刷新] 账号 %s 令牌已过期（>25分钟），执行刷新", account.ID)
+		if err != nil || time.Since(lastRefresh) > 22*time.Minute {
+			logger.Debug("[被动刷新] 账号 %s 令牌已过期（>22分钟），执行刷新", account.ID)
 			if err := s.refreshAccountToken(ctx, account.ID); err != nil {
 				logger.Warn("[被动刷新] 账号 %s 令牌刷新失败: %v", account.ID, err)
 				return nil, fmt.Errorf("令牌刷新失败: %w", err)

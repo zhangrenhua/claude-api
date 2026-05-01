@@ -40,7 +40,7 @@ const (
 	// 与 cooldownSeconds 取 max，避免「长请求结束后立刻被再次选中」
 	cooldownPostRequestForced = 5 * time.Second
 	// cooldownInFlightTimeout cooldown 模式 in-flight 状态的兜底超时，超过则强制释放（防止状态泄漏）
-	cooldownInFlightTimeout = 3 * time.Minute
+	cooldownInFlightTimeout = 2*time.Minute + 6*time.Second
 	// cooldownUrgentExpiryWindow cooldown 模式下「即将过期」账号的优先窗口
 	// 剩余有效期 ≤ 该窗口的账号优先被选中（与前端 isAccountExpiringSoon 的 7 天阈值保持一致）
 	cooldownUrgentExpiryWindow = 7 * 24 * time.Hour
