@@ -169,11 +169,12 @@ func main() {
 	// 启动 HTTP 服务器
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      server.Router(),
-		ReadTimeout:  60 * time.Second, // 覆盖大 context + 多工具的慢上传场景
-		WriteTimeout: 300 * time.Second, // 流式响应需要较长超时
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           server.Router(),
+		ReadHeaderTimeout: 30 * time.Second, // 防慢速 header 攻击
+		ReadTimeout:       120 * time.Second, // 覆盖大 context + 多工具的慢上传场景
+		WriteTimeout:      0,                // 关闭：SSE 长流式响应由上游 context + 客户端断开感知控制
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 在 goroutine 中启动服务器

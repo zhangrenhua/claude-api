@@ -251,7 +251,8 @@ const (
 	// DefaultIdleConnTimeout 空闲连接超时时间
 	DefaultIdleConnTimeout = 120 * time.Second
 	// DefaultResponseHeaderTimeout 响应头超时时间
-	DefaultResponseHeaderTimeout = 120 * time.Second
+	// 覆盖上游排队 / 慢首字节场景；流开始后改由 stream.StreamDataIntervalTimeout (180s) 控制
+	DefaultResponseHeaderTimeout = 300 * time.Second
 	// DefaultTLSHandshakeTimeout TLS 握手超时时间
 	DefaultTLSHandshakeTimeout = 15 * time.Second
 )
@@ -307,7 +308,10 @@ func NewClient(cfg *config.Config) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   300 * time.Second,
+			// Timeout=0：禁用总超时，避免长流式响应被强制截断
+			// 上游响应头由 transport.ResponseHeaderTimeout 控制（300s），
+			// 流过程由调用侧 stream.ReadWithIntervalTimeout (180s) 控制
+			Timeout: 0,
 		},
 		cfg:           cfg,
 		baseTransport: baseTransport,
@@ -587,6 +591,14 @@ func (c *Client) GetUsageLimits(ctx context.Context, accessToken, machineId, res
 		resourceType = "AGENTIC_REQUEST"
 	}
 
+	// 兜底超时：来自 context.Background() 的后台调用本身没 deadline，
+	// 而 http.Client.Timeout=0，需要在此层补上以防 body 读阶段无限挂起
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+	}
+
 	url := fmt.Sprintf("%sgetUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=%s", AmazonQEndpoint, resourceType)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -722,6 +734,7 @@ func (c *Client) GetHTTPClientForAccount(accountID string) *http.Client {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   300 * time.Second,
+		// Timeout=0：见 NewClient 注释，长流式响应不能用总超时
+		Timeout: 0,
 	}
 }

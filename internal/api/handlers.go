@@ -2443,6 +2443,15 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		}
 	}
 
+	// 非流式请求：为整个上游交互（含重试与 body 读取）加 5 分钟兜底超时
+	// 流式请求依赖 stream.ReadWithIntervalTimeout (180s) 控制，不在此处加总超时
+	upstreamCtx := c.Request.Context()
+	if !req.Stream {
+		var cancelUpstream context.CancelFunc
+		upstreamCtx, cancelUpstream = context.WithTimeout(upstreamCtx, 5*time.Minute)
+		defer cancelUpstream()
+	}
+
 	// 带重试的账号选择和请求
 	var acc *models.Account
 	var resp *http.Response
@@ -2508,7 +2517,7 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 		}
 
 		machineId := s.ensureAccountMachineID(c.Request.Context(), acc)
-		resp, err = s.aqClient.SendChatRequest(c.Request.Context(), *acc.AccessToken, machineId, acc.ID, aqPayload, logTimestamp)
+		resp, err = s.aqClient.SendChatRequest(upstreamCtx, *acc.AccessToken, machineId, acc.ID, aqPayload, logTimestamp)
 		if err != nil {
 			lastErr = err
 
@@ -2516,6 +2525,13 @@ func (s *Server) handleClaudeMessages(c *gin.Context) {
 			if c.Request.Context().Err() == context.Canceled {
 				logger.Info("请求被客户端取消，终止重试")
 				return
+			}
+
+			// 非流式 upstreamCtx 5min 兜底已到期：避免后续 EnsureAccountReady + SendChatRequest 浪费时间
+			if upstreamCtx.Err() != nil {
+				logger.Warn("非流式请求总超时，终止重试 - 错误: %v", upstreamCtx.Err())
+				lastErr = fmt.Errorf("上游响应超时: %w", upstreamCtx.Err())
+				break
 			}
 
 			// 检查是否为不可重试错误
@@ -2643,9 +2659,12 @@ func (s *Server) handleConsoleStreamResponse(c *gin.Context, resp *http.Response
 
 	reader := bufio.NewReader(resp.Body)
 	buf := make([]byte, 4096)
+	rc := http.NewResponseController(c.Writer)
 
 	c.Stream(func(w io.Writer) bool {
-		n, err := reader.Read(buf)
+		n, err := stream.ReadWithIntervalTimeout(c.Request.Context(), reader, buf, stream.StreamDataIntervalTimeout, resp.Body)
+		// 每轮写下游设独立 deadline，防止慢速读取 DoS
+		_ = rc.SetWriteDeadline(time.Now().Add(stream.StreamWriteDeadline))
 		if err != nil {
 			if err != io.EOF {
 				logger.Info("读取流错误 - 来源: %s, 错误: %v", clientIP, err)
@@ -2719,9 +2738,11 @@ func (s *Server) handleClaudeStreamResponse(c *gin.Context, resp *http.Response,
 
 	reader := bufio.NewReader(resp.Body)
 	buf := make([]byte, 4096)
+	rc := http.NewResponseController(c.Writer)
 
 	c.Stream(func(w io.Writer) bool {
-		n, err := reader.Read(buf)
+		n, err := stream.ReadWithIntervalTimeout(c.Request.Context(), reader, buf, stream.StreamDataIntervalTimeout, resp.Body)
+		_ = rc.SetWriteDeadline(time.Now().Add(stream.StreamWriteDeadline))
 		if err != nil {
 			if err != io.EOF {
 				logger.Info("读取流错误 - 来源: %s, 错误: %v", clientIP, err)
@@ -3106,6 +3127,15 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 
 	logger.Info("Chat Completions 请求 - 模型: %s, 流式: %v, 消息数: %d, 工具数: %d", req.Model, req.Stream, len(req.Messages), len(req.Tools))
 
+	// 非流式请求：为整个上游交互（含重试与 body 读取）加 5 分钟兜底超时
+	// 流式请求依赖 stream.ReadWithIntervalTimeout (180s) 控制，不在此处加总超时
+	upstreamCtx := c.Request.Context()
+	if !req.Stream {
+		var cancelUpstream context.CancelFunc
+		upstreamCtx, cancelUpstream = context.WithTimeout(upstreamCtx, 5*time.Minute)
+		defer cancelUpstream()
+	}
+
 	// 被动刷新策略：确保账号可用（刷新令牌和配额）
 	// 执行流程：检查令牌 -> 刷新配额 -> 配额错误时刷新令牌 -> 重试
 	// 整个过程对用户透明无感知
@@ -3148,7 +3178,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	responseID := "chatcmpl-" + uuid.New().String()[:8]
 	aqPayloadJSON, _ := json.MarshalIndent(aqPayload, "", "  ")
 	machineId := s.ensureAccountMachineID(c.Request.Context(), account)
-	resp, err := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
+	resp, err := s.aqClient.SendChatRequest(upstreamCtx, *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
 	if err != nil {
 		logger.Error("OpenAI 请求失败 - 账号: %s, 错误: %v", account.ID, err)
 
@@ -3184,7 +3214,7 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 							inputTokens, _, _ = countClaudeInputTokens(claudeReq)
 							aqPayload2, convErr2 := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
 							if convErr2 == nil {
-								resp2, err2 := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
+								resp2, err2 := s.aqClient.SendChatRequest(upstreamCtx, *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
 								if err2 == nil {
 									logger.Info("[自动压缩重试] OpenAI接口 - 压缩后重试成功 - Token: %d, 消息数: %d", inputTokens, len(claudeReq.Messages))
 									resp = resp2
@@ -3243,9 +3273,11 @@ func (s *Server) handleOpenAIStreamResponse(c *gin.Context, resp *http.Response,
 
 	reader := bufio.NewReader(resp.Body)
 	buf := make([]byte, 4096)
+	rc := http.NewResponseController(c.Writer)
 
 	c.Stream(func(w io.Writer) bool {
-		n, err := reader.Read(buf)
+		n, err := stream.ReadWithIntervalTimeout(c.Request.Context(), reader, buf, stream.StreamDataIntervalTimeout, resp.Body)
+		_ = rc.SetWriteDeadline(time.Now().Add(stream.StreamWriteDeadline))
 		if err != nil {
 			if err != io.EOF {
 				logger.Info("读取流错误 - 来源: %s, 错误: %v", clientIP, err)
@@ -3565,6 +3597,15 @@ func (s *Server) handleResponses(c *gin.Context) {
 
 	logger.Info("Responses 请求 - 模型: %s, 流式: %v, 消息数: %d, 工具数: %d", chatReq.Model, chatReq.Stream, len(chatReq.Messages), len(chatReq.Tools))
 
+	// 非流式请求：为整个上游交互（含重试与 body 读取）加 5 分钟兜底超时
+	// 流式请求依赖 stream.ReadWithIntervalTimeout (180s) 控制，不在此处加总超时
+	upstreamCtx := c.Request.Context()
+	if !chatReq.Stream {
+		var cancelUpstream context.CancelFunc
+		upstreamCtx, cancelUpstream = context.WithTimeout(upstreamCtx, 5*time.Minute)
+		defer cancelUpstream()
+	}
+
 	// 被动刷新策略：确保账号可用
 	preparedID := account.ID
 	account, err = s.EnsureAccountReady(c.Request.Context(), account)
@@ -3615,7 +3656,7 @@ func (s *Server) handleResponses(c *gin.Context) {
 	responseID := "resp_" + uuid.New().String()[:8]
 	aqPayloadJSON, _ := json.MarshalIndent(aqPayload, "", "  ")
 	machineId := s.ensureAccountMachineID(c.Request.Context(), account)
-	resp, err := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
+	resp, err := s.aqClient.SendChatRequest(upstreamCtx, *account.AccessToken, machineId, account.ID, aqPayload, logTimestamp)
 	if err != nil {
 		logger.Error("Responses 请求失败 - 账号: %s, 错误: %v", account.ID, err)
 
@@ -3648,7 +3689,7 @@ func (s *Server) handleResponses(c *gin.Context) {
 							inputTokens, _, _ = countClaudeInputTokens(claudeReq)
 							aqPayload2, convErr2 := claude.ConvertClaudeToAmazonQ(claudeReq, conversationID, false)
 							if convErr2 == nil {
-								resp2, err2 := s.aqClient.SendChatRequest(c.Request.Context(), *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
+								resp2, err2 := s.aqClient.SendChatRequest(upstreamCtx, *account.AccessToken, machineId, account.ID, aqPayload2, logTimestamp)
 								if err2 == nil {
 									logger.Info("[自动压缩重试] Responses接口 - 压缩后重试成功 - Token: %d", inputTokens)
 									resp = resp2
@@ -3706,9 +3747,11 @@ func (s *Server) handleResponsesStreamResponse(c *gin.Context, resp *http.Respon
 
 	reader := bufio.NewReader(resp.Body)
 	buf := make([]byte, 4096)
+	rc := http.NewResponseController(c.Writer)
 
 	c.Stream(func(w io.Writer) bool {
-		n, err := reader.Read(buf)
+		n, err := stream.ReadWithIntervalTimeout(c.Request.Context(), reader, buf, stream.StreamDataIntervalTimeout, resp.Body)
+		_ = rc.SetWriteDeadline(time.Now().Add(stream.StreamWriteDeadline))
 		if err != nil {
 			if err != io.EOF {
 				logger.Info("读取流错误 - 来源: %s, 错误: %v", clientIP, err)
