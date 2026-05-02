@@ -56,6 +56,33 @@ func TestHandleEvent_AssistantResponseEnd_SendsMessageStop(t *testing.T) {
 	}
 }
 
+func TestHandleEvent_AssistantResponseEnd_StopReasonToolUse(t *testing.T) {
+	handler := NewClaudeStreamHandler("claude-sonnet-4", 100)
+	handler.ConversationID = "test-conv-id"
+	handler.MessageStartSent = true
+	handler.ProcessedToolUseIDs["tool_abc"] = true
+
+	events := handler.HandleEvent("assistantResponseEnd", map[string]interface{}{})
+	joined := strings.Join(events, "")
+
+	if !strings.Contains(joined, `"stop_reason":"tool_use"`) {
+		t.Errorf("有工具调用时 stop_reason 应为 tool_use, got: %s", joined)
+	}
+}
+
+func TestFinish_StopReasonToolUse(t *testing.T) {
+	handler := NewClaudeStreamHandler("claude-sonnet-4", 100)
+	handler.ConversationID = "test-conv-id"
+	handler.OutputDeltaCount = 50
+	handler.ProcessedToolUseIDs["tool_abc"] = true
+
+	result := handler.Finish()
+
+	if !strings.Contains(result, `"stop_reason":"tool_use"`) {
+		t.Errorf("Finish 在有工具调用时 stop_reason 应为 tool_use, got: %s", result)
+	}
+}
+
 // TestHandleEvent_AssistantResponseEnd_SetsResponseEnded 测试 assistantResponseEnd 设置 ResponseEnded 标志
 func TestHandleEvent_AssistantResponseEnd_SetsResponseEnded(t *testing.T) {
 	handler := NewClaudeStreamHandler("claude-sonnet-4", 100)

@@ -768,7 +768,7 @@ func (h *ClaudeStreamHandler) HandleEvent(eventType string, payload map[string]i
 				outputTokens = 1
 			}
 		}
-		events = append(events, BuildMessageStop(h.InputTokens, outputTokens, "end_turn"))
+		events = append(events, BuildMessageStop(h.InputTokens, outputTokens, h.stopReason()))
 
 	case "meteringEvent":
 		// 提取 credit usage
@@ -991,8 +991,15 @@ func (h *ClaudeStreamHandler) Finish() string {
 		}
 	}
 
-	result += BuildMessageStop(h.InputTokens, outputTokens, "end_turn")
+	result += BuildMessageStop(h.InputTokens, outputTokens, h.stopReason())
 	return result
+}
+
+func (h *ClaudeStreamHandler) stopReason() string {
+	if len(h.ProcessedToolUseIDs) > 0 {
+		return "tool_use"
+	}
+	return "end_turn"
 }
 
 // OutputTokens 返回基于流式事件的输出 token 数
